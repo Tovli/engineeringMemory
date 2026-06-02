@@ -1,0 +1,16 @@
+[package]
+name = "tovli"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.77"
+description = "tovli — RuVector-based technical memory assistant (M0 spike)"
+license = "MIT"
+
+[[bin]]
+name = "tovli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+ruvector-core = { version = "2.2.0", default-features = false, features = ["storage", "hnsw", "parallel"] }
+serde_json = "1.0.150"
