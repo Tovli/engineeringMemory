@@ -10,6 +10,17 @@ license = "MIT"
 name = "tovli"
 path = "src/main.rs"
 
+# ONNX verification spike (M1 task #13). Built only with `--features onnx` so the
+# default build stays light and does not pull ort/onnxruntime/tokenizers.
+[[bin]]
+name = "verify-onnx"
+path = "src/bin/verify-onnx.rs"
+required-features = ["onnx"]
+
+[features]
+# Enables ruvector-core's local ONNX embeddings (MiniLM via ort + tokenizers).
+onnx = ["ruvector-core/onnx-embeddings"]
+
 [dependencies]
 anyhow = "1.0.102"
 ruvector-core = { version = "2.2.0", default-features = false, features = ["storage", "hnsw", "parallel"] }

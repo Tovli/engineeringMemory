@@ -1,0 +1,25 @@
+{
+  "feature": "M1 — Document Ingestion",
+  "slug": "m1-document-ingestion",
+  "phase": 4,
+  "phaseName": "Refinement",
+  "startedAt": "2026-06-02",
+  "gateAttempts": 0,
+  "gates": [
+    { "phase": 1, "name": "Specification", "passed": true, "note": "8 ACs, 6 constraints, 8 edge cases; D-EMB resolved (Local ONNX → MSVC)" },
+    { "phase": 2, "name": "Pseudocode", "passed": true, "note": "all ACs covered, error paths + complexity; ONNX contingency cleared by task #13" },
+    { "phase": 3, "name": "Architecture", "passed": true, "note": "hexagonal Rust translation of DDD ingestion context; typed ports; acyclic; ONNX verified (MiniLM, MSVC, dim 384, semantic check)" }
+  ],
+  "artifacts": [
+    "docs/sparc/m1-document-ingestion/01-specification.md",
+    "docs/sparc/m1-document-ingestion/02-pseudocode.md",
+    "docs/sparc/m1-document-ingestion/03-architecture.md",
+    "src/bin/verify-onnx.rs"
+  ],
+  "decisions": {
+    "D-EMB": "Local ONNX (MiniLM) via ruvector-core onnx-embeddings → requires MSVC toolchain (C7)",
+    "D-HASH": "blake3 (default unless changed)",
+    "D-TOK": "char/word heuristic for now",
+    "D-PERSIST": "redb sidecar for documents + incremental state"
+  }
+}
