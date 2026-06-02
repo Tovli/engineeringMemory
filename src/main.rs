@@ -4,9 +4,7 @@
 //! run a k-NN similarity search, and verify the nearest neighbours match docs/spike/M0-spec.md.
 //! All RuVector access goes through the `VectorStore` seam — no engine logic lives here.
 
-mod vector_store;
-
-use vector_store::{Doc, RuVectorStore, VectorStore};
+use tovli::vector_store::{Doc, RuVectorStore, VectorStore};
 
 /// Deterministic 4-dim sample corpus: 3 topic clusters, 2 docs each (see M0-spec.md).
 fn sample_docs() -> Vec<Doc> {
