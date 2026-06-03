@@ -7,6 +7,7 @@ pub mod ports;
 
 pub mod chunking;
 pub mod embedding;
+pub mod model_guard;
 pub mod orchestrator;
 
 pub mod infra;

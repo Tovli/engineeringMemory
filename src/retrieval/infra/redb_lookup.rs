@@ -80,3 +80,105 @@ impl DocumentLookupPort for RedbDocumentLookup {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::ingestion::infra::redb_repo::RedbDocumentRepository;
+    use crate::ingestion::ports::DocumentRepository;
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    fn docs_path() -> String {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let base = std::env::temp_dir().join(format!("tovli-lookup-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&base).unwrap();
+        base.join("documents.redb").to_string_lossy().to_string()
+    }
+
+    fn document(
+        id: &str,
+        path: &str,
+        status: DocumentStatus,
+        model: &str,
+        dim: usize,
+    ) -> IngestionDocument {
+        IngestionDocument {
+            id: id.into(),
+            source_path: path.into(),
+            file_name: "f.md".into(),
+            file_extension: "md".into(),
+            content_hash: "h".into(),
+            title: None,
+            project: Some("proj".into()),
+            tags: vec!["t".into()],
+            status,
+            embedding_model: model.into(),
+            embedding_dimension: dim,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-02T00:00:00Z".into(),
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn missing_file_is_treated_as_an_empty_index() {
+        // AC-8: opening a never-created documents.redb is not an error.
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir()
+            .join(format!("tovli-missing-{}-{}.redb", std::process::id(), n))
+            .to_string_lossy()
+            .to_string();
+        let lookup = RedbDocumentLookup::open(&path).unwrap();
+        assert!(lookup.indexed_model_version().unwrap().is_none());
+        assert!(lookup.find_many(&["d1".to_string()]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn indexed_model_version_ignores_deleted_docs() {
+        // R6/AC-7: the guard must report the ACTIVE index's model, never a stale deleted one.
+        let path = docs_path();
+        {
+            let repo = RedbDocumentRepository::open(&path).unwrap();
+            repo.save(&document("d_del", "docs/old.md", DocumentStatus::Deleted, "stale-model", 16))
+                .unwrap();
+            repo.save(&document("d_act", "docs/new.md", DocumentStatus::Active, "live-model", 384))
+                .unwrap();
+        }
+        let lookup = RedbDocumentLookup::open(&path).unwrap();
+        let mv = lookup.indexed_model_version().unwrap().expect("an active doc provides the model");
+        assert_eq!(mv.name, "live-model");
+        assert_eq!(mv.dimension, 384);
+    }
+
+    #[test]
+    fn all_deleted_means_empty_index() {
+        let path = docs_path();
+        {
+            let repo = RedbDocumentRepository::open(&path).unwrap();
+            repo.save(&document("d1", "docs/a.md", DocumentStatus::Deleted, "m", 8)).unwrap();
+        }
+        let lookup = RedbDocumentLookup::open(&path).unwrap();
+        assert!(lookup.indexed_model_version().unwrap().is_none());
+    }
+
+    #[test]
+    fn find_many_returns_only_requested_ids_with_full_metadata() {
+        let path = docs_path();
+        {
+            let repo = RedbDocumentRepository::open(&path).unwrap();
+            repo.save(&document("d1", "docs/a.md", DocumentStatus::Active, "m", 8)).unwrap();
+            repo.save(&document("d2", "docs/b.md", DocumentStatus::Active, "m", 8)).unwrap();
+        }
+        let lookup = RedbDocumentLookup::open(&path).unwrap();
+        let got = lookup.find_many(&["d1".to_string()]).unwrap();
+        assert_eq!(got.len(), 1);
+        let meta = got.get("d1").expect("d1 resolved");
+        assert_eq!(meta.source_path, "docs/a.md");
+        assert_eq!(meta.project.as_deref(), Some("proj"));
+        assert_eq!(meta.tags, vec!["t".to_string()]);
+        assert_eq!(meta.status, DocumentStatus::Active);
+        assert!(!got.contains_key("d2"), "unrequested id must not appear");
+    }
+}

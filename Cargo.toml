@@ -26,7 +26,7 @@ onnx = ["ruvector-core/onnx-embeddings"]
 anyhow = "1.0.102"
 blake3 = "1.8.5"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
-clap = { version = "4.5.61", features = ["derive"] }
+clap = { version = "4.5.61", features = ["derive", "env"] }
 pulldown-cmark = "0.13.4"
 redb = "2.2.0"
 ruvector-core = { version = "2.2.0", default-features = false, features = ["storage", "hnsw", "parallel"] }

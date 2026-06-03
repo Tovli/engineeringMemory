@@ -30,3 +30,35 @@ impl std::fmt::Display for RetrievalError {
 }
 
 impl std::error::Error for RetrievalError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(name: &str, dim: usize) -> EmbeddingModelVersion {
+        EmbeddingModelVersion { name: name.into(), dimension: dim, created_at: "t".into() }
+    }
+
+    #[test]
+    fn empty_query_message() {
+        assert_eq!(RetrievalError::EmptyQuery.to_string(), "query must not be empty");
+    }
+
+    #[test]
+    fn invalid_topk_message() {
+        assert!(RetrievalError::InvalidTopK.to_string().contains("top-k"));
+    }
+
+    #[test]
+    fn mismatch_message_names_both_models_dims_and_remediation() {
+        // The user-facing message must surface both models, both dimensions, and the fix.
+        let e = RetrievalError::EmbeddingModelMismatch {
+            indexed: model("minilm", 384),
+            query: model("mock-deterministic", 8),
+        };
+        let s = e.to_string();
+        assert!(s.contains("minilm") && s.contains("384"), "names indexed model: {s}");
+        assert!(s.contains("mock-deterministic") && s.contains('8'), "names query model: {s}");
+        assert!(s.contains("reembed"), "suggests re-indexing: {s}");
+    }
+}
