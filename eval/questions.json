@@ -1,0 +1,27 @@
+[
+  { "id": "q_001", "question": "What are the supported file types for ingestion?", "expectedSourceFiles": ["docs/prd.md"] },
+  { "id": "q_002", "question": "What are the default chunk size settings — target, max, and overlap tokens?", "expectedSourceFiles": ["docs/prd.md"] },
+  { "id": "q_003", "question": "What retrieval metrics must the evaluation compute, like Hit@K and MRR?", "expectedSourceFiles": ["docs/prd.md"] },
+  { "id": "q_004", "question": "What is the target Hit@3 quality bar on the curated dataset?", "expectedSourceFiles": ["docs/prd.md", "docs/sparc/m3-retrieval-eval/01-specification.md"] },
+  { "id": "q_005", "question": "Why must retrieval be proven before answer generation?", "expectedSourceFiles": ["docs/prd.md"] },
+  { "id": "q_006", "question": "How does the system avoid mixing embeddings with incompatible dimensions?", "expectedSourceFiles": ["docs/prd.md"] },
+
+  { "id": "q_007", "question": "What is the responsibility of the Retrieval bounded context?", "expectedSourceFiles": ["docs/ddd/contexts/retrieval.md"] },
+  { "id": "q_008", "question": "Why is the Retrieval context read-only with respect to the vector index?", "expectedSourceFiles": ["docs/ddd/contexts/retrieval.md"] },
+  { "id": "q_009", "question": "What does the Ingestion context do from raw file to indexed vector?", "expectedSourceFiles": ["docs/ddd/contexts/ingestion.md"] },
+  { "id": "q_010", "question": "How does the Evaluation context relate to the Retrieval context?", "expectedSourceFiles": ["docs/ddd/contexts/evaluation.md"] },
+  { "id": "q_011", "question": "What metrics does the EvalMetrics value object hold?", "expectedSourceFiles": ["docs/ddd/contexts/evaluation.md"] },
+  { "id": "q_012", "question": "What fields make up an EvalQuestion and what is its invariant?", "expectedSourceFiles": ["docs/ddd/contexts/evaluation.md"] },
+
+  { "id": "q_013", "question": "Why are project and tag filters applied via a document-lookup join instead of the vector store?", "expectedSourceFiles": ["docs/adrs/0002-project-tag-filter-join.md"] },
+  { "id": "q_014", "question": "How is cosine distance converted to a similarity score and why over-fetch before filtering?", "expectedSourceFiles": ["docs/adrs/0003-score-semantics-and-overfetch.md"] },
+  { "id": "q_015", "question": "Why is retrieval implemented as its own read-only hexagonal module?", "expectedSourceFiles": ["docs/adrs/0001-retrieval-bounded-context.md"] },
+  { "id": "q_016", "question": "How is relevance judged — exact chunk id or path-tolerant source match?", "expectedSourceFiles": ["docs/adrs/0004-relevance-judgment.md"] },
+  { "id": "q_017", "question": "Why retrieve at least five results and how is CI kept deterministic without ONNX?", "expectedSourceFiles": ["docs/adrs/0005-eval-depth-and-ci-determinism.md"] },
+
+  { "id": "q_018", "question": "What does the tovli search command do and what are its acceptance criteria?", "expectedSourceFiles": ["docs/sparc/m2-retrieval-cli/01-specification.md"] },
+  { "id": "q_019", "question": "What is the SearchService pipeline: validate, embed, over-fetch, join, filter, rank?", "expectedSourceFiles": ["docs/sparc/m2-retrieval-cli/02-pseudocode.md"] },
+  { "id": "q_020", "question": "How does the M3 evaluation pseudocode compute Hit@K and MRR per question?", "expectedSourceFiles": ["docs/sparc/m3-retrieval-eval/02-pseudocode.md"] },
+  { "id": "q_021", "question": "What was the M1 ingestion architecture and how were embeddings generated with ONNX MiniLM?", "expectedSourceFiles": ["docs/sparc/m1-document-ingestion/03-architecture.md"] },
+  { "id": "q_022", "question": "What did the M0 spike validate about running RuVector locally without Docker?", "expectedSourceFiles": ["docs/spike/M0-spec.md", "docs/spike/M0-setup.md"] }
+]

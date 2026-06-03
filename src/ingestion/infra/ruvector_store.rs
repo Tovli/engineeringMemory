@@ -26,7 +26,7 @@ impl RuVectorStoreAdapter {
             dimensions: dimension,
             distance_metric: DistanceMetric::Cosine,
             storage_path: vector_path.to_string(),
-            hnsw_config: Some(Default::default()),
+            hnsw_config: Some(crate::vector_store::default_hnsw_config()),
             quantization: Some(QuantizationConfig::None),
         };
         let db = VectorDB::new(options).map_err(|e| anyhow::anyhow!(e.to_string()))?;
