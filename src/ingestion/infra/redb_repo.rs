@@ -76,3 +76,83 @@ impl DocumentRepository for RedbDocumentRepository {
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    fn repo_path() -> String {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let base = std::env::temp_dir().join(format!("tovli-repo-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&base).unwrap();
+        base.join("documents.redb").to_string_lossy().to_string()
+    }
+
+    fn document(id: &str, path: &str, status: DocumentStatus) -> IngestionDocument {
+        IngestionDocument {
+            id: id.into(),
+            source_path: path.into(),
+            file_name: "f.md".into(),
+            file_extension: "md".into(),
+            content_hash: "h".into(),
+            title: None,
+            project: None,
+            tags: vec![],
+            status,
+            embedding_model: "m".into(),
+            embedding_dimension: 8,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-02T00:00:00Z".into(),
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn find_by_path_miss_returns_none() {
+        let repo = RedbDocumentRepository::open(&repo_path()).unwrap();
+        assert!(repo.find_by_path("docs/nope.md").unwrap().is_none());
+    }
+
+    #[test]
+    fn save_then_find_round_trips() {
+        let repo = RedbDocumentRepository::open(&repo_path()).unwrap();
+        repo.save(&document("d1", "docs/a.md", DocumentStatus::Active)).unwrap();
+        let got = repo.find_by_path("docs/a.md").unwrap().expect("saved doc found");
+        assert_eq!(got.id, "d1");
+        assert_eq!(got.status, DocumentStatus::Active);
+    }
+
+    #[test]
+    fn soft_delete_finds_record_by_id_and_flips_status() {
+        // soft_delete keys by id even though the table is keyed by source_path.
+        let repo = RedbDocumentRepository::open(&repo_path()).unwrap();
+        repo.save(&document("d1", "docs/a.md", DocumentStatus::Active)).unwrap();
+        repo.soft_delete(&"d1".to_string()).unwrap();
+        let got = repo.find_by_path("docs/a.md").unwrap().unwrap();
+        assert_eq!(got.status, DocumentStatus::Deleted);
+    }
+
+    #[test]
+    fn soft_delete_unknown_id_is_a_noop() {
+        let repo = RedbDocumentRepository::open(&repo_path()).unwrap();
+        repo.save(&document("d1", "docs/a.md", DocumentStatus::Active)).unwrap();
+        repo.soft_delete(&"ghost".to_string()).unwrap();
+        assert_eq!(repo.find_by_path("docs/a.md").unwrap().unwrap().status, DocumentStatus::Active);
+    }
+
+    #[test]
+    fn active_under_filters_by_root_prefix_and_excludes_deleted() {
+        let repo = RedbDocumentRepository::open(&repo_path()).unwrap();
+        repo.save(&document("d1", "proj_a/a.md", DocumentStatus::Active)).unwrap();
+        repo.save(&document("d2", "proj_a/sub/b.md", DocumentStatus::Active)).unwrap();
+        repo.save(&document("d3", "proj_b/c.md", DocumentStatus::Active)).unwrap();
+        repo.save(&document("d4", "proj_a/old.md", DocumentStatus::Deleted)).unwrap();
+
+        let mut ids: Vec<String> =
+            repo.active_under("proj_a").unwrap().into_iter().map(|d| d.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["d1".to_string(), "d2".to_string()], "only active docs under proj_a");
+    }
+}

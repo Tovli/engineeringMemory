@@ -111,3 +111,103 @@ impl VectorStorePort for RuVectorStoreAdapter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::ingestion::domain::Chunk;
+    use crate::retrieval::infra::ruvector_search::RuVectorSearchAdapter;
+    use crate::retrieval::ports::VectorSearchPort;
+
+    const DIM: usize = 8;
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    struct Paths {
+        vectors: String,
+        chunkmap: String,
+    }
+    fn paths() -> Paths {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let base = std::env::temp_dir().join(format!("tovli-rvstore-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&base).unwrap();
+        Paths {
+            vectors: base.join("vectors.redb").to_string_lossy().to_string(),
+            chunkmap: base.join("chunkmap.redb").to_string_lossy().to_string(),
+        }
+    }
+
+    fn chunk(id: &str, doc: &str, idx: u32) -> Chunk {
+        Chunk {
+            id: id.into(),
+            document_id: doc.into(),
+            chunk_index: idx,
+            heading_path: vec!["H".into()],
+            content: format!("content {id}"),
+            preview: format!("preview {id}"),
+            content_hash: "hash".into(),
+            token_count: 3,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// Distinct, normalizable vectors so cosine search always returns the present rows.
+    fn vec_of(seed: u8) -> Vec<f32> {
+        (0..DIM).map(|i| ((seed as usize + i) % 7 + 1) as f32 / 8.0).collect()
+    }
+
+    #[test]
+    fn upsert_then_search_round_trips_the_chunk() {
+        let p = paths();
+        {
+            let store = RuVectorStoreAdapter::open(&p.vectors, &p.chunkmap, DIM).unwrap();
+            let c1 = chunk("c1", "d1", 0);
+            store.upsert_chunks(&[ChunkWithEmbedding { chunk: &c1, vector: vec_of(1) }]).unwrap();
+        } // drop store → release locks before reopening read-side
+        let search = RuVectorSearchAdapter::open(&p.vectors, DIM).unwrap();
+        let hits = search.vector_search(&vec_of(1), 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chunk_id, "c1");
+        assert_eq!(hits[0].document_id, "d1");
+    }
+
+    #[test]
+    fn upsert_rejects_dimension_mismatch() {
+        let p = paths();
+        let store = RuVectorStoreAdapter::open(&p.vectors, &p.chunkmap, DIM).unwrap();
+        let c = chunk("c1", "d1", 0);
+        let items = vec![ChunkWithEmbedding { chunk: &c, vector: vec![0.0; DIM + 1] }];
+        let err = store.upsert_chunks(&items).unwrap_err();
+        assert!(format!("{err:#}").contains("dim mismatch"), "got: {err:#}");
+    }
+
+    #[test]
+    fn delete_removes_every_chunk_of_a_doc_across_separate_upserts() {
+        // Two upserts for d1 must MERGE in the chunk-id map (not overwrite), so deleting
+        // d1 removes both c1 and c2; an unrelated doc d2 is untouched. If the map overwrote
+        // instead of appending, c1 would leak and survive the delete.
+        let p = paths();
+        {
+            let store = RuVectorStoreAdapter::open(&p.vectors, &p.chunkmap, DIM).unwrap();
+            let (c1, c2, c3) = (chunk("c1", "d1", 0), chunk("c2", "d1", 1), chunk("c3", "d2", 0));
+            store.upsert_chunks(&[ChunkWithEmbedding { chunk: &c1, vector: vec_of(1) }]).unwrap();
+            store.upsert_chunks(&[ChunkWithEmbedding { chunk: &c2, vector: vec_of(2) }]).unwrap();
+            store.upsert_chunks(&[ChunkWithEmbedding { chunk: &c3, vector: vec_of(3) }]).unwrap();
+            store.delete_by_document(&"d1".to_string()).unwrap();
+        }
+        let search = RuVectorSearchAdapter::open(&p.vectors, DIM).unwrap();
+        let hits = search.vector_search(&vec_of(1), 10).unwrap();
+        let ids: Vec<_> = hits.iter().map(|h| h.chunk_id.as_str()).collect();
+        assert_eq!(ids, vec!["c3"], "only d2's chunk should survive; got {ids:?}");
+    }
+
+    #[test]
+    fn delete_unknown_document_is_a_noop_even_with_no_map_table() {
+        // A fresh store has never written the DOC_CHUNKS table; deleting must not error.
+        let p = paths();
+        let store = RuVectorStoreAdapter::open(&p.vectors, &p.chunkmap, DIM).unwrap();
+        store.delete_by_document(&"ghost".to_string()).unwrap();
+    }
+}

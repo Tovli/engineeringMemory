@@ -23,3 +23,29 @@ impl EvalQuestion {
         !self.expected_chunk_ids.is_empty() || !self.expected_source_files.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn q(chunk_ids: Vec<String>, source_files: Vec<String>) -> EvalQuestion {
+        EvalQuestion {
+            id: "q".into(),
+            question: "what?".into(),
+            expected_chunk_ids: chunk_ids,
+            expected_source_files: source_files,
+        }
+    }
+
+    #[test]
+    fn has_ground_truth_when_either_list_is_non_empty() {
+        assert!(q(vec!["c1".into()], vec![]).has_ground_truth());
+        assert!(q(vec![], vec!["docs/a.md".into()]).has_ground_truth());
+        assert!(q(vec!["c1".into()], vec!["docs/a.md".into()]).has_ground_truth());
+    }
+
+    #[test]
+    fn no_ground_truth_when_both_lists_are_empty() {
+        assert!(!q(vec![], vec![]).has_ground_truth());
+    }
+}

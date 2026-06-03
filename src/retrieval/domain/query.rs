@@ -42,3 +42,21 @@ pub struct Query {
     /// The model the query will be embedded with; checked against the index (R6).
     pub embedding_model: EmbeddingModelVersion,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_filter_is_empty_only_when_nothing_is_set() {
+        assert!(MetadataFilter::default().is_empty());
+        assert!(!MetadataFilter { project: Some("p".into()), ..Default::default() }.is_empty());
+        assert!(!MetadataFilter { tags: vec!["t".into()], ..Default::default() }.is_empty());
+        assert!(!MetadataFilter { source: Some("s.md".into()), ..Default::default() }.is_empty());
+    }
+
+    #[test]
+    fn search_mode_renders_as_lowercase_vector() {
+        assert_eq!(SearchMode::Vector.to_string(), "vector");
+    }
+}

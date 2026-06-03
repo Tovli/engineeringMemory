@@ -1,0 +1,86 @@
+name: CI
+
+# Runs on PRs into main and on pushes to main. Feature branches get CI via their PR.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build · clippy · test (windows-msvc)
+    # Windows MSVC matches rust-toolchain.toml (channel = stable-x86_64-pc-windows-msvc).
+    # The default build is ONNX-free (the `onnx` feature is local/opt-in), so no ONNX
+    # Runtime download is needed and CI stays fast, offline, and deterministic (ADR-0005).
+    runs-on: windows-latest
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned toolchain + clippy
+        # rust-toolchain.toml pins the channel with `profile = minimal`, so clippy must be
+        # added explicitly. `rustup show` triggers the pinned-toolchain install first.
+        run: |
+          rustup show
+          rustup component add clippy
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked --verbose
+
+      - name: Clippy (all targets, warnings = errors)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test (lib unit + integration)
+        # Deterministic, offline: MockEmbedder only, no ONNX, no network (ADR-0005).
+        run: cargo test --locked --verbose
+
+  eval-smoke:
+    name: eval CLI smoke (non-gating quality)
+    runs-on: windows-latest
+    needs: build-test
+    # Proves the ingest → eval CLI pipeline runs end-to-end and writes a report. It does
+    # NOT assert a Hit@3 threshold: the MockEmbedder is non-semantic, so quality numbers
+    # over the full docs corpus are not meaningful — semantic Hit@3 >= 0.80 is verified
+    # locally with ONNX (ADR-0005). This job catches wiring regressions, not retrieval quality.
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Ingest docs corpus (mock embedder)
+        run: cargo run --locked --quiet -- ingest docs --mock --project tovli
+
+      - name: Run evaluation (mock, no threshold gate)
+        run: cargo run --locked --quiet -- eval eval/questions.json --mock --output eval/report.json
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval/report.json
+          if-no-files-found: warn
