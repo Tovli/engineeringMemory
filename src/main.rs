@@ -1,12 +1,149 @@
-//! tovli — M0 RuVector spike.
-//!
-//! Proves RuVector can be embedded and queried from Rust: ingest vectors with metadata,
-//! run a k-NN similarity search, and verify the nearest neighbours match docs/spike/M0-spec.md.
-//! All RuVector access goes through the `VectorStore` seam — no engine logic lives here.
+//! tovli CLI — thin shell over the `tovli` library (PRD §9.4). No engine logic here.
 
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand};
+
+use tovli::ingestion::chunking::ChunkingService;
+use tovli::ingestion::domain::{ChunkingConfig, IngestionSummary};
+use tovli::ingestion::infra::mock_embedder::MockEmbedder;
+use tovli::ingestion::infra::parsers::default_parsers;
+use tovli::ingestion::infra::redb_repo::RedbDocumentRepository;
+use tovli::ingestion::infra::ruvector_store::RuVectorStoreAdapter;
+use tovli::ingestion::orchestrator::{IngestOptions, IngestionOrchestrator};
+use tovli::ingestion::ports::Embedder;
 use tovli::vector_store::{Doc, RuVectorStore, VectorStore};
 
-/// Deterministic 4-dim sample corpus: 3 topic clusters, 2 docs each (see M0-spec.md).
+#[derive(Parser)]
+#[command(name = "tovli", about = "RuVector-based technical memory assistant", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the M0 RuVector spike (embedded similarity-search demo).
+    Spike,
+    /// Ingest a folder of documents into the vector store.
+    Ingest(IngestArgs),
+}
+
+#[derive(Args)]
+struct IngestArgs {
+    /// Folder to ingest (scanned recursively).
+    path: PathBuf,
+    /// Report what would be ingested without writing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Re-ingest even unchanged files.
+    #[arg(long)]
+    force: bool,
+    /// Tag every ingested document with this project name.
+    #[arg(long)]
+    project: Option<String>,
+    /// Add a tag (repeatable).
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    /// Use the deterministic mock embedder instead of local ONNX.
+    #[arg(long)]
+    mock: bool,
+}
+
+const STORE_DIR: &str = ".tovli";
+
+fn main() -> anyhow::Result<()> {
+    match Cli::parse().command {
+        Command::Spike => run_spike(),
+        Command::Ingest(args) => run_ingest(args),
+    }
+}
+
+#[cfg(feature = "onnx")]
+fn build_embedder(mock: bool) -> anyhow::Result<Box<dyn Embedder>> {
+    if mock {
+        Ok(Box::new(MockEmbedder::new(384)))
+    } else {
+        use tovli::ingestion::infra::onnx_embedder::OnnxEmbedder;
+        Ok(Box::new(OnnxEmbedder::open_minilm()?))
+    }
+}
+
+#[cfg(not(feature = "onnx"))]
+fn build_embedder(_mock: bool) -> anyhow::Result<Box<dyn Embedder>> {
+    // Built without the `onnx` feature → only the mock embedder is available.
+    Ok(Box::new(MockEmbedder::new(384)))
+}
+
+fn run_ingest(args: IngestArgs) -> anyhow::Result<()> {
+    std::fs::create_dir_all(STORE_DIR)?;
+
+    let embedder = build_embedder(args.mock)?;
+    let dim = embedder.model_version().dimension;
+    println!("embedder: {} (dim {dim})", embedder.model_version().name);
+
+    let store = RuVectorStoreAdapter::open(
+        &format!("{STORE_DIR}/vectors.redb"),
+        &format!("{STORE_DIR}/chunkmap.redb"),
+        dim,
+    )?;
+    let docs = RedbDocumentRepository::open(&format!("{STORE_DIR}/documents.redb"))?;
+    let parsers = default_parsers();
+    let config = ChunkingConfig::default();
+    config.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+    let orchestrator = IngestionOrchestrator {
+        parsers: &parsers,
+        embedder: embedder.as_ref(),
+        store: &store,
+        docs: &docs,
+        chunking: ChunkingService::new(config),
+    };
+
+    let opts = IngestOptions {
+        dry_run: args.dry_run,
+        force: args.force,
+        project: args.project,
+        tags: args.tags,
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let summary = orchestrator.ingest(&args.path, &opts, &now)?;
+    print_summary(&summary, &config);
+    Ok(())
+}
+
+fn print_summary(s: &IngestionSummary, config: &ChunkingConfig) {
+    println!("\n== ingestion summary{} ==", if s.dry_run { " (dry-run)" } else { "" });
+    println!(
+        "chunking: target={} max={} overlap={} tokens",
+        config.target_tokens, config.max_tokens, config.overlap_tokens
+    );
+    println!("files scanned   : {}", s.files_scanned);
+    println!("files ingested  : {}", s.files_ingested);
+    println!("files unchanged : {}", s.files_unchanged);
+    println!("files empty     : {}", s.files_empty);
+    println!("files skipped   : {}", s.files_skipped);
+    println!("files errored   : {}", s.files_errored);
+    println!("files deleted   : {}", s.files_deleted);
+    println!("chunks created  : {}", s.chunks_created);
+    if !s.skipped.is_empty() {
+        println!("skipped:");
+        for (p, r) in &s.skipped {
+            println!("  - {p}: {r}");
+        }
+    }
+    if !s.errors.is_empty() {
+        println!("errors:");
+        for (p, r) in &s.errors {
+            println!("  - {p}: {r}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M0 spike (preserved): deterministic 4-dim corpus, k-NN, self-check.
+// ---------------------------------------------------------------------------
+
 fn sample_docs() -> Vec<Doc> {
     let mk = |id: &str, v: [f32; 4], title: &str, topic: &str, source: &str| Doc {
         id: id.to_string(),
@@ -25,8 +162,7 @@ fn sample_docs() -> Vec<Doc> {
     ]
 }
 
-fn main() -> anyhow::Result<()> {
-    // Fresh, isolated DB file each run for determinism.
+fn run_spike() -> anyhow::Result<()> {
     let db_path = std::env::temp_dir().join("tovli-m0-spike.redb");
     let _ = std::fs::remove_file(&db_path);
     let db_path_str = db_path.to_string_lossy().to_string();
@@ -36,13 +172,11 @@ fn main() -> anyhow::Result<()> {
     println!("store  : {db_path_str}\n");
 
     let store = RuVectorStore::open(&db_path_str, 4)?;
-
     let docs = sample_docs();
     let ingested = store.upsert(&docs)?;
     let count = store.count()?;
     println!("ingested {ingested} docs, store count = {count}\n");
 
-    // "Architecture-flavoured" query (see spec).
     let query = vec![0.95_f32, 0.05, 0.0, 0.0];
     let started = std::time::Instant::now();
     let hits = store.query(query.clone(), 3)?;
@@ -62,7 +196,6 @@ fn main() -> anyhow::Result<()> {
     }
     println!("latency: {latency:?}\n");
 
-    // ---- Automated success criteria (M0-spec.md) ----
     let scores_sorted = hits.windows(2).all(|w| w[0].score <= w[1].score + 1e-6);
     let checks: Vec<(&str, bool)> = vec![
         ("count == 6", count == 6),

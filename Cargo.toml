@@ -3,8 +3,9 @@ name = "tovli"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.77"
-description = "tovli — RuVector-based technical memory assistant (M0 spike)"
+description = "tovli — RuVector-based technical memory assistant"
 license = "MIT"
+default-run = "tovli"
 
 [[bin]]
 name = "tovli"
@@ -24,6 +25,7 @@ onnx = ["ruvector-core/onnx-embeddings"]
 [dependencies]
 anyhow = "1.0.102"
 blake3 = "1.8.5"
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 clap = { version = "4.5.61", features = ["derive"] }
 pulldown-cmark = "0.13.4"
 redb = "2.2.0"
