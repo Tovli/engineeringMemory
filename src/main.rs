@@ -12,6 +12,11 @@ use tovli::ingestion::infra::redb_repo::RedbDocumentRepository;
 use tovli::ingestion::infra::ruvector_store::RuVectorStoreAdapter;
 use tovli::ingestion::orchestrator::{IngestOptions, IngestionOrchestrator};
 use tovli::ingestion::ports::Embedder;
+use tovli::retrieval::application::SearchService;
+use tovli::retrieval::domain::{MetadataFilter, Query, RetrievalRun, RunReason, SearchMode};
+use tovli::retrieval::infra::redb_lookup::RedbDocumentLookup;
+use tovli::retrieval::infra::ruvector_search::RuVectorSearchAdapter;
+use tovli::retrieval::ports::DocumentLookupPort;
 use tovli::vector_store::{Doc, RuVectorStore, VectorStore};
 
 #[derive(Parser)]
@@ -27,6 +32,8 @@ enum Command {
     Spike,
     /// Ingest a folder of documents into the vector store.
     Ingest(IngestArgs),
+    /// Search the indexed chunks by vector similarity.
+    Search(SearchArgs),
 }
 
 #[derive(Args)]
@@ -50,12 +57,40 @@ struct IngestArgs {
     mock: bool,
 }
 
+#[derive(Args)]
+struct SearchArgs {
+    /// The natural-language question.
+    query: String,
+    /// Maximum number of results to return.
+    #[arg(long = "top-k", default_value_t = 8)]
+    top_k: usize,
+    /// Search mode. Only `vector` is available in Milestone 2 (keyword/hybrid arrive in M5).
+    #[arg(long, default_value = "vector")]
+    mode: String,
+    /// Only return chunks from documents in this project.
+    #[arg(long)]
+    project: Option<String>,
+    /// Only return chunks from documents carrying this tag (repeatable; all must match).
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    /// Only return chunks from this exact source file.
+    #[arg(long)]
+    source: Option<String>,
+    /// Show ranking/eligibility details for debugging retrieval.
+    #[arg(long)]
+    explain: bool,
+    /// Use the deterministic mock embedder instead of local ONNX.
+    #[arg(long)]
+    mock: bool,
+}
+
 const STORE_DIR: &str = ".tovli";
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Spike => run_spike(),
         Command::Ingest(args) => run_ingest(args),
+        Command::Search(args) => run_search(args),
     }
 }
 
@@ -136,6 +171,107 @@ fn print_summary(s: &IngestionSummary, config: &ChunkingConfig) {
         println!("errors:");
         for (p, r) in &s.errors {
             println!("  - {p}: {r}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M2 search (Retrieval context). CLI stays thin — all logic lives in SearchService.
+// ---------------------------------------------------------------------------
+
+fn run_search(args: SearchArgs) -> anyhow::Result<()> {
+    if args.mode != "vector" {
+        eprintln!("mode '{}' is available in Milestone 5; use --mode vector", args.mode);
+        std::process::exit(2);
+    }
+
+    let embedder = build_embedder(args.mock)?;
+    let model = embedder.model_version().clone();
+
+    let query = Query {
+        text: args.query,
+        mode: SearchMode::Vector,
+        filters: MetadataFilter { project: args.project, tags: args.tags, source: args.source },
+        top_k: args.top_k,
+        embedding_model: model,
+    };
+
+    let lookup = RedbDocumentLookup::open(&format!("{STORE_DIR}/documents.redb"))?;
+
+    // Size the vector store by the indexed model so we never open it with a wrong dimension.
+    // No active document ⇒ empty index (AC-8) — report and exit 0 without opening the store.
+    let Some(indexed) = lookup.indexed_model_version()? else {
+        print_header(&query);
+        println!("index is empty — run `tovli ingest <folder>` first");
+        return Ok(());
+    };
+    let store = RuVectorSearchAdapter::open(&format!("{STORE_DIR}/vectors.redb"), indexed.dimension)?;
+
+    let svc = SearchService { embedder: embedder.as_ref(), store: &store, lookup: &lookup };
+    let run_id = format!("rrun_{}", chrono::Utc::now().timestamp_millis());
+    let now = chrono::Utc::now().to_rfc3339();
+    let run = svc.search(&query, args.explain, &run_id, &now)?; // mismatch (AC-7) surfaces here
+    print_results(&run);
+    Ok(())
+}
+
+fn render_filters(f: &MetadataFilter) -> String {
+    if f.is_empty() {
+        return "(none)".to_string();
+    }
+    let mut parts = Vec::new();
+    if let Some(p) = &f.project {
+        parts.push(format!("project={p}"));
+    }
+    for t in &f.tags {
+        parts.push(format!("tag={t}"));
+    }
+    if let Some(s) = &f.source {
+        parts.push(format!("source={s}"));
+    }
+    parts.join("  ")
+}
+
+fn print_header(query: &Query) {
+    println!("query  : \"{}\"   mode={}  top-k={}", query.text, query.mode, query.top_k);
+    println!("filters: {}", render_filters(&query.filters));
+}
+
+fn print_results(run: &RetrievalRun) {
+    print_header(&run.query);
+    if run.reason == RunReason::IndexEmpty {
+        println!("index is empty — run `tovli ingest <folder>` first");
+        return;
+    }
+    if run.results.is_empty() {
+        let suffix = if run.query.filters.is_empty() { "" } else { " for these filters" };
+        println!("no results{suffix}");
+        return;
+    }
+    for r in &run.results {
+        println!("#{:<2} score={:.4}  {}", r.rank, r.score, r.source_path);
+        if !r.heading_path.is_empty() {
+            println!("      {}", r.heading_path.join(" > "));
+        }
+        let first_line = r.preview.lines().next().unwrap_or("");
+        println!("      {first_line}   [{}]", r.chunk_id);
+    }
+    println!("\nlatency: {} ms   below-threshold: {}", run.latency_ms, run.below_threshold_count);
+    if let Some(ex) = &run.explain {
+        println!("\n== explain ==");
+        println!("provider     : {} (dim {})", ex.query_embedding_provider, ex.query_embedding_dimension);
+        println!("search mode  : {}", ex.search_mode);
+        println!("ranking      : {}", ex.ranking_method);
+        println!("filters      : {}", render_filters(&ex.filters_applied));
+        for d in &ex.result_details {
+            println!(
+                "  #{:<2} chunk={} vector={:.4} fused={:.4} :: {}",
+                d.rank,
+                d.chunk_id,
+                d.vector_score.unwrap_or(0.0),
+                d.fused_score,
+                d.eligibility_reason
+            );
         }
     }
 }
