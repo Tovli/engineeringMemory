@@ -60,6 +60,9 @@ jobs:
     # locally with ONNX (ADR-0005). This job catches wiring regressions, not retrieval quality.
     env:
       CARGO_TERM_COLOR: always
+      # Isolate the index in a scratch dir so the smoke job never touches a real `.tovli`,
+      # even when these steps are run locally. (Picked up by tovli's --store / TOVLI_STORE.)
+      TOVLI_STORE: ${{ runner.temp }}/tovli-ci
 
     steps:
       - name: Checkout

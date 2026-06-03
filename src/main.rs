@@ -1,6 +1,6 @@
 //! tovli CLI — thin shell over the `tovli` library (PRD §9.4). No engine logic here.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -10,6 +10,7 @@ use tovli::ingestion::infra::mock_embedder::MockEmbedder;
 use tovli::ingestion::infra::parsers::default_parsers;
 use tovli::ingestion::infra::redb_repo::RedbDocumentRepository;
 use tovli::ingestion::infra::ruvector_store::RuVectorStoreAdapter;
+use tovli::ingestion::model_guard::ensure_index_model_compatible;
 use tovli::ingestion::orchestrator::{IngestOptions, IngestionOrchestrator};
 use tovli::ingestion::ports::Embedder;
 use tovli::retrieval::application::SearchService;
@@ -29,6 +30,11 @@ use tovli::vector_store::{Doc, RuVectorStore, VectorStore};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Directory holding the index files (vectors.redb, chunkmap.redb, documents.redb).
+    /// Point this at a scratch dir to isolate experiments or CI from your working index.
+    #[arg(long, global = true, env = "TOVLI_STORE", default_value = ".tovli")]
+    store: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -112,14 +118,29 @@ struct EvalArgs {
     mock: bool,
 }
 
-const STORE_DIR: &str = ".tovli";
+/// The three redb files that make up an index, resolved under the `--store` directory.
+struct StorePaths {
+    vectors: String,
+    chunkmap: String,
+    documents: String,
+}
+
+fn store_paths(store: &Path) -> StorePaths {
+    let p = |name: &str| store.join(name).to_string_lossy().to_string();
+    StorePaths {
+        vectors: p("vectors.redb"),
+        chunkmap: p("chunkmap.redb"),
+        documents: p("documents.redb"),
+    }
+}
 
 fn main() -> anyhow::Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    match cli.command {
         Command::Spike => run_spike(),
-        Command::Ingest(args) => run_ingest(args),
-        Command::Search(args) => run_search(args),
-        Command::Eval(args) => run_eval(args),
+        Command::Ingest(args) => run_ingest(args, &cli.store),
+        Command::Search(args) => run_search(args, &cli.store),
+        Command::Eval(args) => run_eval(args, &cli.store),
     }
 }
 
@@ -139,19 +160,27 @@ fn build_embedder(_mock: bool) -> anyhow::Result<Box<dyn Embedder>> {
     Ok(Box::new(MockEmbedder::new(384)))
 }
 
-fn run_ingest(args: IngestArgs) -> anyhow::Result<()> {
-    std::fs::create_dir_all(STORE_DIR)?;
+fn run_ingest(args: IngestArgs, store_dir: &Path) -> anyhow::Result<()> {
+    let paths = store_paths(store_dir);
 
     let embedder = build_embedder(args.mock)?;
-    let dim = embedder.model_version().dimension;
-    println!("embedder: {} (dim {dim})", embedder.model_version().name);
+    let model = embedder.model_version().clone();
 
-    let store = RuVectorStoreAdapter::open(
-        &format!("{STORE_DIR}/vectors.redb"),
-        &format!("{STORE_DIR}/chunkmap.redb"),
-        dim,
-    )?;
-    let docs = RedbDocumentRepository::open(&format!("{STORE_DIR}/documents.redb"))?;
+    // Guard: refuse to mix embedding models in one index (write-side mirror of the retrieval
+    // R6/AC-7 guard). Read the existing index model without creating the file, and drop the
+    // read handle (inner scope) before opening the write handles below — redb locks per file.
+    {
+        let existing = RedbDocumentLookup::open(&paths.documents)?.indexed_model_version()?;
+        ensure_index_model_compatible(existing.as_ref(), &model, args.force)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+
+    std::fs::create_dir_all(store_dir)?;
+    let dim = model.dimension;
+    println!("embedder: {} (dim {dim})", model.name);
+
+    let store = RuVectorStoreAdapter::open(&paths.vectors, &paths.chunkmap, dim)?;
+    let docs = RedbDocumentRepository::open(&paths.documents)?;
     let parsers = default_parsers();
     let config = ChunkingConfig::default();
     config.validate().map_err(|e| anyhow::anyhow!(e))?;
@@ -208,12 +237,13 @@ fn print_summary(s: &IngestionSummary, config: &ChunkingConfig) {
 // M2 search (Retrieval context). CLI stays thin — all logic lives in SearchService.
 // ---------------------------------------------------------------------------
 
-fn run_search(args: SearchArgs) -> anyhow::Result<()> {
+fn run_search(args: SearchArgs, store_dir: &Path) -> anyhow::Result<()> {
     if args.mode != "vector" {
         eprintln!("mode '{}' is available in Milestone 5; use --mode vector", args.mode);
         std::process::exit(2);
     }
 
+    let paths = store_paths(store_dir);
     let embedder = build_embedder(args.mock)?;
     let model = embedder.model_version().clone();
 
@@ -225,7 +255,7 @@ fn run_search(args: SearchArgs) -> anyhow::Result<()> {
         embedding_model: model,
     };
 
-    let lookup = RedbDocumentLookup::open(&format!("{STORE_DIR}/documents.redb"))?;
+    let lookup = RedbDocumentLookup::open(&paths.documents)?;
 
     // Size the vector store by the indexed model so we never open it with a wrong dimension.
     // No active document ⇒ empty index (AC-8) — report and exit 0 without opening the store.
@@ -234,7 +264,7 @@ fn run_search(args: SearchArgs) -> anyhow::Result<()> {
         println!("index is empty — run `tovli ingest <folder>` first");
         return Ok(());
     };
-    let store = RuVectorSearchAdapter::open(&format!("{STORE_DIR}/vectors.redb"), indexed.dimension)?;
+    let store = RuVectorSearchAdapter::open(&paths.vectors, indexed.dimension)?;
 
     let svc = SearchService { embedder: embedder.as_ref(), store: &store, lookup: &lookup };
     let run_id = format!("rrun_{}", chrono::Utc::now().timestamp_millis());
@@ -309,20 +339,21 @@ fn print_results(run: &RetrievalRun) {
 // M3 eval (Evaluation context). CLI loads dataset, delegates to EvaluationService, writes report.
 // ---------------------------------------------------------------------------
 
-fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
+fn run_eval(args: EvalArgs, store_dir: &Path) -> anyhow::Result<()> {
     if args.mode != "vector" {
         eprintln!("mode '{}' is available in Milestone 5; use --mode vector", args.mode);
         std::process::exit(2);
     }
+    let paths = store_paths(store_dir);
     let dataset_path = args.path.to_string_lossy().to_string();
     let questions = load_dataset(&dataset_path)?;
 
     let embedder = build_embedder(args.mock)?;
     let model = embedder.model_version().clone();
 
-    let lookup = RedbDocumentLookup::open(&format!("{STORE_DIR}/documents.redb"))?;
+    let lookup = RedbDocumentLookup::open(&paths.documents)?;
     let dim = lookup.indexed_model_version()?.map(|m| m.dimension).unwrap_or(model.dimension);
-    let store = RuVectorSearchAdapter::open(&format!("{STORE_DIR}/vectors.redb"), dim)?;
+    let store = RuVectorSearchAdapter::open(&paths.vectors, dim)?;
 
     let search = SearchService { embedder: embedder.as_ref(), store: &store, lookup: &lookup };
     let adapter = RetrievalSearchAdapter { inner: search };
