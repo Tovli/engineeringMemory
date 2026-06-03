@@ -1,0 +1,6 @@
+# M1 switches to the MSVC toolchain: ONNX Runtime (ort 2.0) ships MSVC-only
+# prebuilt binaries on Windows, and tokenizers' `onig` feature compiles C.
+# See docs/sparc/m1-document-ingestion/01-specification.md (constraint C7).
+[toolchain]
+channel = "stable-x86_64-pc-windows-msvc"
+profile = "minimal"

@@ -1,0 +1,35 @@
+[package]
+name = "tovli"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.77"
+description = "tovli — RuVector-based technical memory assistant"
+license = "MIT"
+default-run = "tovli"
+
+[[bin]]
+name = "tovli"
+path = "src/main.rs"
+
+# ONNX verification spike (M1 task #13). Built only with `--features onnx` so the
+# default build stays light and does not pull ort/onnxruntime/tokenizers.
+[[bin]]
+name = "verify-onnx"
+path = "src/bin/verify-onnx.rs"
+required-features = ["onnx"]
+
+[features]
+# Enables ruvector-core's local ONNX embeddings (MiniLM via ort + tokenizers).
+onnx = ["ruvector-core/onnx-embeddings"]
+
+[dependencies]
+anyhow = "1.0.102"
+blake3 = "1.8.5"
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+clap = { version = "4.5.61", features = ["derive"] }
+pulldown-cmark = "0.13.4"
+redb = "2.2.0"
+ruvector-core = { version = "2.2.0", default-features = false, features = ["storage", "hnsw", "parallel"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+walkdir = "2.5.0"
