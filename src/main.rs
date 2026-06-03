@@ -17,6 +17,11 @@ use tovli::retrieval::domain::{MetadataFilter, Query, RetrievalRun, RunReason, S
 use tovli::retrieval::infra::redb_lookup::RedbDocumentLookup;
 use tovli::retrieval::infra::ruvector_search::RuVectorSearchAdapter;
 use tovli::retrieval::ports::DocumentLookupPort;
+use tovli::evaluation::application::EvaluationService;
+use tovli::evaluation::domain::{EvalRun, EvalRunConfig, EvalRunStatus, ThresholdConfig};
+use tovli::evaluation::infra::dataset_loader::load_dataset;
+use tovli::evaluation::infra::report_writer::write_report;
+use tovli::evaluation::infra::retrieval_search_adapter::RetrievalSearchAdapter;
 use tovli::vector_store::{Doc, RuVectorStore, VectorStore};
 
 #[derive(Parser)]
@@ -34,6 +39,8 @@ enum Command {
     Ingest(IngestArgs),
     /// Search the indexed chunks by vector similarity.
     Search(SearchArgs),
+    /// Evaluate retrieval quality against a ground-truth dataset.
+    Eval(EvalArgs),
 }
 
 #[derive(Args)]
@@ -84,6 +91,27 @@ struct SearchArgs {
     mock: bool,
 }
 
+#[derive(Args)]
+struct EvalArgs {
+    /// Path to the evaluation questions JSON.
+    path: PathBuf,
+    /// Search mode. Only `vector` is available until Milestone 5.
+    #[arg(long, default_value = "vector")]
+    mode: String,
+    /// Retrieval depth per question (at least 5 is used internally so Hit@5/MRR are computable).
+    #[arg(long = "top-k", default_value_t = 5)]
+    top_k: usize,
+    /// Exit non-zero when Hit@3 falls below this fraction (CI regression gate).
+    #[arg(long = "fail-below-hit-at-3")]
+    fail_below_hit_at_3: Option<f64>,
+    /// Where to write the JSON report.
+    #[arg(long, default_value = "./eval/report.json")]
+    output: String,
+    /// Use the deterministic mock embedder instead of local ONNX.
+    #[arg(long)]
+    mock: bool,
+}
+
 const STORE_DIR: &str = ".tovli";
 
 fn main() -> anyhow::Result<()> {
@@ -91,6 +119,7 @@ fn main() -> anyhow::Result<()> {
         Command::Spike => run_spike(),
         Command::Ingest(args) => run_ingest(args),
         Command::Search(args) => run_search(args),
+        Command::Eval(args) => run_eval(args),
     }
 }
 
@@ -274,6 +303,74 @@ fn print_results(run: &RetrievalRun) {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// M3 eval (Evaluation context). CLI loads dataset, delegates to EvaluationService, writes report.
+// ---------------------------------------------------------------------------
+
+fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
+    if args.mode != "vector" {
+        eprintln!("mode '{}' is available in Milestone 5; use --mode vector", args.mode);
+        std::process::exit(2);
+    }
+    let dataset_path = args.path.to_string_lossy().to_string();
+    let questions = load_dataset(&dataset_path)?;
+
+    let embedder = build_embedder(args.mock)?;
+    let model = embedder.model_version().clone();
+
+    let lookup = RedbDocumentLookup::open(&format!("{STORE_DIR}/documents.redb"))?;
+    let dim = lookup.indexed_model_version()?.map(|m| m.dimension).unwrap_or(model.dimension);
+    let store = RuVectorSearchAdapter::open(&format!("{STORE_DIR}/vectors.redb"), dim)?;
+
+    let search = SearchService { embedder: embedder.as_ref(), store: &store, lookup: &lookup };
+    let adapter = RetrievalSearchAdapter { inner: search };
+    let evaluator = EvaluationService { search: &adapter };
+
+    let config = EvalRunConfig {
+        mode: SearchMode::Vector,
+        top_k: args.top_k,
+        threshold: ThresholdConfig { min_hit_at_3: args.fail_below_hit_at_3 },
+        embedding_model: model,
+    };
+    let run_id = format!("ev_{}", chrono::Utc::now().timestamp_millis());
+    let now = chrono::Utc::now().to_rfc3339();
+    let run = evaluator.run(&questions, &config, &dataset_path, &run_id, &now);
+
+    print_eval(&run);
+    write_report(&args.output, &run)?;
+    println!("report written to {}", args.output);
+
+    match run.status {
+        EvalRunStatus::Failed => {
+            eprintln!("evaluation failed: {}", run.error.unwrap_or_default());
+            std::process::exit(1);
+        }
+        EvalRunStatus::ThresholdFailed => {
+            eprintln!(
+                "Hit@3 {:.2} is below the configured threshold {:.2}",
+                run.metrics.hit_at_3,
+                config.threshold.min_hit_at_3.unwrap_or(0.0)
+            );
+            std::process::exit(1);
+        }
+        EvalRunStatus::Completed => Ok(()),
+    }
+}
+
+fn print_eval(run: &EvalRun) {
+    let m = &run.metrics;
+    println!("== evaluation ==");
+    println!("dataset        : {}", run.dataset_path);
+    println!("mode           : {}  top-k={}", run.search_mode, run.top_k);
+    println!("model          : {} (dim {})", run.embedding_model.name, run.embedding_model.dimension);
+    println!("questions      : {}", m.question_count);
+    println!("Hit@1/3/5      : {:.2} / {:.2} / {:.2}", m.hit_at_1, m.hit_at_3, m.hit_at_5);
+    println!("MRR            : {:.3}", m.mrr);
+    println!("avg latency    : {:.1} ms", m.avg_latency_ms);
+    println!("empty results  : {}", m.empty_result_count);
+    println!("below threshold: {}", m.below_threshold_count);
 }
 
 // ---------------------------------------------------------------------------

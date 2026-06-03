@@ -6,9 +6,20 @@
 
 use std::collections::HashMap;
 
-use ruvector_core::types::{DbOptions, QuantizationConfig};
+use ruvector_core::types::{DbOptions, HnswConfig, QuantizationConfig};
 use ruvector_core::{DistanceMetric, SearchQuery, VectorDB, VectorEntry};
 use serde_json::Value;
+
+/// Bounded HNSW capacity shared by every `VectorDB` we open (M0 store + ingestion + retrieval).
+/// `HnswConfig::default()` sets `max_elements = 10_000_000`, which pre-allocates several GB per
+/// index instance — one fits, but parallel instances (e.g. concurrent tests) OOM. 100k is ample
+/// headroom over the PRD's 5,000-chunk target (§9.1) at a fraction of the memory.
+pub const MAX_INDEX_ELEMENTS: usize = 100_000;
+
+/// The HNSW config used everywhere: defaults except a bounded `max_elements`.
+pub fn default_hnsw_config() -> HnswConfig {
+    HnswConfig { max_elements: MAX_INDEX_ELEMENTS, ..Default::default() }
+}
 
 /// A document to index.
 #[derive(Debug, Clone)]
@@ -51,7 +62,7 @@ impl RuVectorStore {
             dimensions,
             distance_metric: DistanceMetric::Cosine,
             storage_path: path.to_string(),
-            hnsw_config: Some(Default::default()),
+            hnsw_config: Some(default_hnsw_config()),
             quantization: Some(QuantizationConfig::None),
         };
         let db = VectorDB::new(options).map_err(|e| anyhow::anyhow!(e.to_string()))?;
