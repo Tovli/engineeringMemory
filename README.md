@@ -6,9 +6,10 @@ in an embedded RuVector index, and lets you search or ask questions from the
 command line.
 
 The project is designed as a practical, open-source learning implementation of
-a retrieval-augmented generation pipeline. The default path is offline and
-deterministic: no Docker, Postgres, cloud API key, or model download is needed
-to build, test, ingest, search, evaluate, or generate mock cited answers.
+a retrieval-augmented generation pipeline. The default embedding path is local
+ONNX/MiniLM, so no Docker, Postgres, or cloud API key is needed. A deterministic
+mock embedder remains available with `--mock` or `--no-default-features` for
+lightweight development and CI.
 
 ## Features
 
@@ -16,8 +17,8 @@ to build, test, ingest, search, evaluate, or generate mock cited answers.
 - UTF-8 parsers for `.md`, `.txt`, `.json`, `.yaml`, and `.yml`.
 - Markdown-aware chunking with heading paths and code-fence preservation.
 - Embedded vector storage with `ruvector-core` and `redb`.
+- Local ONNX/MiniLM embeddings by default.
 - Deterministic mock embeddings for repeatable local development and CI.
-- Optional ONNX/MiniLM embeddings behind the `onnx` Cargo feature.
 - Vector search with `--top-k`, `--project`, `--tag`, `--source`, and
   `--explain`.
 - Retrieval evaluation with Hit@1, Hit@3, Hit@5, MRR, latency, and an optional
@@ -78,7 +79,7 @@ Run the local RuVector smoke test:
 cargo run --bin tovli -- spike
 ```
 
-Ingest the project docs with the default deterministic mock embedder:
+Ingest the project docs with the default local ONNX/MiniLM embedder:
 
 ```powershell
 cargo run --bin tovli -- ingest ./docs
@@ -118,20 +119,23 @@ tovli ask <query> [--top-k <n>] [--mode vector] [--show-context] [--no-llm] [--m
 Only `--mode vector` is currently implemented. Keyword and hybrid modes are
 planned.
 
-## Optional ONNX Embeddings
+## Embedding Providers
 
-The default build uses the mock embedder so development stays light and
-deterministic. To use the local ONNX/MiniLM embedding path, build with the
-`onnx` feature:
+The default build enables the `onnx` Cargo feature and uses `OnnxEmbedder`,
+which loads MiniLM from:
+
+- `models/all-MiniLM-L6-v2/model.onnx`
+- `models/all-MiniLM-L6-v2/tokenizer.json`
+
+Verify the local model files and ONNX runtime stack with:
 
 ```powershell
-cargo run --features onnx --bin verify-onnx
-cargo run --features onnx --bin tovli -- ingest ./docs
-cargo run --features onnx --bin tovli -- search "architecture boundaries"
+cargo run --bin verify-onnx
 ```
 
-When the binary is built with `--features onnx`, pass `--mock` to any CLI
-command if you want to force the deterministic mock embedder instead.
+Pass `--mock` to `ingest`, `search`, `eval`, or `ask` to force the deterministic
+mock embedder. To avoid compiling ONNX dependencies entirely, build with
+`--no-default-features`.
 
 ## Evaluation Dataset
 

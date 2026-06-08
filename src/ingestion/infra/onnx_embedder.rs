@@ -1,6 +1,6 @@
 //! OnnxEmbedder — Embedder port backed by ruvector-core's local ONNX/MiniLM model.
 //! Uses `from_files` with a locally cached model (from_pretrained is broken in hf-hub 0.3).
-//! Compiled only with `--features onnx`.
+//! Compiled when the `onnx` Cargo feature is enabled.
 
 use std::path::PathBuf;
 

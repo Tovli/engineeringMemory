@@ -5,7 +5,7 @@
 //! embeddings are *semantic*: "dog" is closer to "cat" than to "car". If this passes, the
 //! MSVC + ort + onnxruntime + MiniLM stack is proven and M1 can build on it.
 //!
-//! Run: cargo run --features onnx --bin verify-onnx
+//! Run: cargo run --bin verify-onnx
 
 use ruvector_core::{EmbeddingProvider, OnnxEmbedding};
 

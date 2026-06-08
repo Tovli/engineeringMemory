@@ -97,7 +97,7 @@ When reporting a bug, include:
 - The actual behavior.
 - Relevant logs or output.
 - Your OS and Rust version.
-- Whether you used the mock embedder or `--features onnx`.
+- Whether you used the default ONNX embedder, `--mock`, or `--no-default-features`.
 
 Do not include private documents, API keys, secrets, or proprietary source text
 in public issues.

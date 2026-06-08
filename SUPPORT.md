@@ -30,7 +30,7 @@ Include these details when relevant:
 - OS and shell.
 - Rust and Cargo versions.
 - Exact command you ran.
-- Whether you used the default mock embedder or `--features onnx`.
+- Whether you used the default ONNX embedder, `--mock`, or `--no-default-features`.
 - A small sample document or evaluation dataset when it is safe to share.
 - The observed output and expected output.
 
