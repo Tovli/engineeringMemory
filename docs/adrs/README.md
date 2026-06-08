@@ -10,7 +10,11 @@ Lightweight ADRs for tovli. One file per decision, numbered sequentially. Format
 | [0003](0003-score-semantics-and-overfetch.md) | Report cosine similarity (1 − distance) and over-fetch before post-filtering | Accepted | M2 |
 | [0004](0004-relevance-judgment.md) | Relevance via exact chunk-id OR path-tolerant source-file match | Accepted | M3 |
 | [0005](0005-eval-depth-and-ci-determinism.md) | Fixed eval retrieval depth (≥5) and deterministic CI without ONNX | Accepted | M3 |
+| [0006](0006-llm-provider-abstraction.md) | LLM provider behind an `LlmPort` seam; domain enforces citations | Accepted | M4 |
+| [0007](0007-prompt-template-versioning.md) | Versioned prompt templates in source, stamped into every answer log | Accepted | M4 |
+| [0008](0008-citation-protocol-and-no-answer-policy.md) | Citation protocol (chunk-id tags) and the no-answer / exit-code policy | Accepted | M4 |
 
 > ADRs 0001–0003 were produced during the **M2 — Retrieval CLI** SPARC Architecture phase
 > (`docs/sparc/m2-retrieval-cli/03-architecture.md`).
 > ADRs 0004–0005 during **M3 — Retrieval Evaluation** (`docs/sparc/m3-retrieval-eval/03-architecture.md`).
+> ADRs 0006–0008 during **M4 — RAG Answer Generation** (`docs/sparc/m4-rag-answer-generation/03-architecture.md`).

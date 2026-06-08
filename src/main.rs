@@ -22,6 +22,10 @@ use tovli::evaluation::domain::{EvalRun, EvalRunConfig, EvalRunStatus, Threshold
 use tovli::evaluation::infra::dataset_loader::load_dataset;
 use tovli::evaluation::infra::report_writer::write_report;
 use tovli::evaluation::infra::retrieval_search_adapter::RetrievalSearchAdapter;
+use tovli::answer_generation::application::rag_service::{AnswerContext, RagAnswerService};
+use tovli::answer_generation::domain::answer::{Answer, NoAnswerReason};
+use tovli::answer_generation::infra::answer_log_writer::append_answer_log;
+use tovli::answer_generation::infra::mock_llm::MockLlm;
 use tovli::vector_store::{Doc, RuVectorStore, VectorStore};
 
 #[derive(Parser)]
@@ -41,6 +45,8 @@ enum Command {
     Search(SearchArgs),
     /// Evaluate retrieval quality against a ground-truth dataset.
     Eval(EvalArgs),
+    /// Ask a question and get a cited answer generated from retrieved chunks (RAG).
+    Ask(AskArgs),
 }
 
 #[derive(Args)]
@@ -112,6 +118,27 @@ struct EvalArgs {
     mock: bool,
 }
 
+#[derive(Args)]
+struct AskArgs {
+    /// The natural-language question.
+    query: String,
+    /// Maximum number of chunks to retrieve as context.
+    #[arg(long = "top-k", default_value_t = 8)]
+    top_k: usize,
+    /// Search mode. Only `vector` is available until Milestone 5.
+    #[arg(long, default_value = "vector")]
+    mode: String,
+    /// Run retrieval only — print the context and skip answer generation (no LLM call).
+    #[arg(long = "no-llm")]
+    no_llm: bool,
+    /// Print the retrieved chunks (rank, score, source, preview) alongside the answer.
+    #[arg(long = "show-context")]
+    show_context: bool,
+    /// Use the deterministic mock embedder instead of local ONNX.
+    #[arg(long)]
+    mock: bool,
+}
+
 const STORE_DIR: &str = ".tovli";
 
 fn main() -> anyhow::Result<()> {
@@ -120,6 +147,7 @@ fn main() -> anyhow::Result<()> {
         Command::Ingest(args) => run_ingest(args),
         Command::Search(args) => run_search(args),
         Command::Eval(args) => run_eval(args),
+        Command::Ask(args) => run_ask(args),
     }
 }
 
@@ -371,6 +399,97 @@ fn print_eval(run: &EvalRun) {
     println!("avg latency    : {:.1} ms", m.avg_latency_ms);
     println!("empty results  : {}", m.empty_result_count);
     println!("below threshold: {}", m.below_threshold_count);
+}
+
+// ---------------------------------------------------------------------------
+// M4 ask (Answer Generation context). CLI retrieves (M2) then delegates generation to
+// RagAnswerService; the domain enforces citations/no-answer. Thin handler (C5/R12).
+// ---------------------------------------------------------------------------
+
+fn run_ask(args: AskArgs) -> anyhow::Result<()> {
+    if args.mode != "vector" {
+        eprintln!("mode '{}' is available in Milestone 5; use --mode vector", args.mode);
+        std::process::exit(2);
+    }
+
+    let embedder = build_embedder(args.mock)?;
+    let model = embedder.model_version().clone();
+
+    let query = Query {
+        text: args.query,
+        mode: SearchMode::Vector,
+        filters: MetadataFilter::default(),
+        top_k: args.top_k,
+        embedding_model: model,
+    };
+    print_header(&query);
+
+    let lookup = RedbDocumentLookup::open(&format!("{STORE_DIR}/documents.redb"))?;
+    // Empty index (no active document) → nothing to ground an answer on (AC-2 territory) — exit 0.
+    let Some(indexed) = lookup.indexed_model_version()? else {
+        println!("index is empty — run `tovli ingest <folder>` first");
+        return Ok(());
+    };
+    let store = RuVectorSearchAdapter::open(&format!("{STORE_DIR}/vectors.redb"), indexed.dimension)?;
+
+    let svc = SearchService { embedder: embedder.as_ref(), store: &store, lookup: &lookup };
+    let ts = chrono::Utc::now().timestamp_millis();
+    let now = chrono::Utc::now().to_rfc3339();
+    let run = svc.search(&query, false, &format!("rrun_{ts}"), &now)?; // model mismatch surfaces here
+
+    if args.show_context || args.no_llm {
+        print_context(&run);
+    }
+    if args.no_llm {
+        // Retrieval-only mode (AC-5): never construct the LLM provider.
+        return Ok(());
+    }
+
+    let llm = MockLlm::default();
+    let rag = RagAnswerService { llm: &llm };
+    let query_id = format!("qry_{ts}");
+    let answer_id = format!("ans_{ts}");
+    let actx = AnswerContext { query_id: &query_id, answer_id: &answer_id, now: &now, max_tokens: 512 };
+    let answer = rag.generate(&run, &actx);
+    print_answer(&answer);
+    append_answer_log(&format!("{STORE_DIR}/answers.jsonl"), &answer)?;
+
+    // Exit codes (ADR-0008 / D-EXITCODE): a no-answer is a valid product response (exit 0); only a
+    // provider failure is a non-zero infra error so scripts/CI can distinguish "no source" from "broken".
+    if answer.no_answer_reason == Some(NoAnswerReason::LlmProviderError) {
+        std::process::exit(3);
+    }
+    Ok(())
+}
+
+fn print_context(run: &RetrievalRun) {
+    println!("\n== retrieved context ==");
+    if run.results.is_empty() {
+        println!("(no chunks retrieved)");
+        return;
+    }
+    for r in &run.results {
+        println!("#{:<2} score={:.4}  {}  [{}]", r.rank, r.score, r.source_path, r.chunk_id);
+        let first_line = r.preview.lines().next().unwrap_or("");
+        if !first_line.is_empty() {
+            println!("      {first_line}");
+        }
+    }
+}
+
+fn print_answer(answer: &Answer) {
+    println!("\n== answer ==");
+    println!("{}", answer.answer_text);
+    match &answer.no_answer_reason {
+        Some(reason) => println!("\n(no answer: {reason:?})"),
+        None => {
+            println!("\nSources:");
+            for (i, c) in answer.citations.iter().enumerate() {
+                println!("{}. {}#{}", i + 1, c.source_path, c.chunk_id);
+            }
+        }
+    }
+    println!("\nprompt: {}   provider: {}", answer.prompt_template_version, answer.llm_provider);
 }
 
 // ---------------------------------------------------------------------------

@@ -2,3 +2,5 @@
 *.redb
 /models
 /.tovli
+.swarm/
+ruvector.db
