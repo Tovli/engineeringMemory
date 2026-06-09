@@ -20,16 +20,18 @@ required-features = ["onnx"]
 [features]
 default = ["onnx"]
 # Enables ruvector-core's local ONNX embeddings (MiniLM via ort + tokenizers).
-onnx = ["ruvector-core/onnx-embeddings"]
+onnx = ["ruvector-core/onnx-embeddings", "dep:dirs", "dep:ureq"]
 
 [dependencies]
 anyhow = "1.0.102"
 blake3 = "1.8.5"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 clap = { version = "4.5.61", features = ["derive"] }
+dirs = { version = "5.0.1", optional = true }
 pulldown-cmark = "0.13.4"
 redb = "2.2.0"
 ruvector-core = { version = "2.2.0", default-features = false, features = ["storage", "hnsw", "parallel"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+ureq = { version = "2.12.1", optional = true }
 walkdir = "2.5.0"

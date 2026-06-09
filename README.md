@@ -121,11 +121,18 @@ planned.
 
 ## Embedding Providers
 
-The default build enables the `onnx` Cargo feature and uses `OnnxEmbedder`,
-which loads MiniLM from:
+The default build enables the `onnx` Cargo feature and uses `OnnxEmbedder`.
+On first use, tovli looks for MiniLM in this order:
 
-- `models/all-MiniLM-L6-v2/model.onnx`
-- `models/all-MiniLM-L6-v2/tokenizer.json`
+- `TOVLI_MINILM_DIR`, when set, containing `model.onnx` and `tokenizer.json`.
+- `models/all-MiniLM-L6-v2/` in the current working directory.
+- The OS user cache, where tovli downloads the files from Hugging Face if they
+  are not already present.
+
+The downloaded files are:
+
+- `onnx/model.onnx`
+- `tokenizer.json`
 
 Verify the local model files and ONNX runtime stack with:
 
