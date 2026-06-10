@@ -1,0 +1,132 @@
+name: Release crates
+
+'on':
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver release version without the v prefix.
+        required: true
+        type: string
+      target_branch:
+        description: Branch to receive the release commit and tag.
+        required: true
+        default: master
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: release-crates-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup show
+
+      - name: Prepare release commit and tag
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          $version = $env:RELEASE_VERSION.Trim()
+          if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw "Release version '$version' must match X.Y.Z"
+          }
+
+          if ($env:TARGET_BRANCH -notmatch '^[A-Za-z0-9._/-]+$' -or $env:TARGET_BRANCH.Contains("..")) {
+            throw "Target branch '$env:TARGET_BRANCH' contains unsupported characters"
+          }
+
+          $tagName = "v$version"
+          git fetch --tags origin
+          git rev-parse -q --verify "refs/tags/$tagName" | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Tag $tagName already exists"
+          }
+
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          foreach ($package in $metadata.packages) {
+            if ($package.publish -eq $false) {
+              Write-Host "Skipping $($package.name) because publish=false"
+              continue
+            }
+
+            $name = $package.name
+            $manifestPath = $package.manifest_path
+            $currentVersion = [string] $package.version
+
+            if ($currentVersion -eq $version) {
+              Write-Host "$name is already at $version"
+              continue
+            }
+
+            $manifest = Get-Content -Raw -Path $manifestPath
+            $versionPattern = '(?m)^(\s*version\s*=\s*)"' + [regex]::Escape($currentVersion) + '"'
+            $versionRegex = [regex] $versionPattern
+            $updated = $versionRegex.Replace($manifest, '${1}"' + $version + '"', 1)
+
+            if ($updated -eq $manifest) {
+              throw "Failed to update version for $name in $manifestPath"
+            }
+
+            Set-Content -Path $manifestPath -Value $updated -NoNewline
+            Write-Host "Set $name version from $currentVersion to $version"
+          }
+
+          cargo update --workspace
+
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          foreach ($package in $metadata.packages) {
+            if ($package.publish -eq $false) {
+              continue
+            }
+
+            if ([string] $package.version -ne $version) {
+              throw "Package $($package.name) version $($package.version) does not match release version $version"
+            }
+          }
+
+          cargo test --locked -- --test-threads=1
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Version $version is already committed"
+          } else {
+            git commit -m "chore: release v$version"
+          }
+
+          git diff --exit-code
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unexpected unstaged changes after release commit"
+          }
+
+          git tag -a $tagName -m "Release $tagName"
+          git push origin "HEAD:$env:TARGET_BRANCH"
+          git push origin $tagName
+
+      - name: Dispatch publish workflow
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          $version = $env:RELEASE_VERSION.Trim()
+          $tagName = "v$version"
+          gh workflow run publish-crates.yml --ref $tagName --field "version=$version"

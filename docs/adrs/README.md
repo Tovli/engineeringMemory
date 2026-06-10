@@ -14,6 +14,7 @@ Lightweight ADRs for tovli. One file per decision, numbered sequentially. Format
 | [0007](0007-prompt-template-versioning.md) | Versioned prompt templates in source, stamped into every answer log | Accepted | M4 |
 | [0008](0008-citation-protocol-and-no-answer-policy.md) | Citation protocol (chunk-id tags) and the no-answer / exit-code policy | Accepted | M4 |
 | [0009](0009-hybrid-search-rrf.md) | Hybrid search uses local keyword candidates and application-level RRF | Accepted | M5 |
+| [0010](0010-committed-release-versions.md) | Publish crates from committed semantic release versions | Accepted | Release Automation |
 
 > ADRs 0001–0003 were produced during the **M2 — Retrieval CLI** SPARC Architecture phase
 > (`docs/sparc/m2-retrieval-cli/03-architecture.md`).

@@ -2,10 +2,14 @@ name: Publish crates
 
 'on':
   push:
-    branches:
-      - main
-      - master
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the v prefix. Must match the selected vX.Y.Z tag.
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -26,45 +30,47 @@ jobs:
         shell: pwsh
         run: rustup show
 
-      - name: Auto-bump crate versions
+      - name: Validate committed release version
         shell: pwsh
         run: |
-          $runNumber = [int64] $env:GITHUB_RUN_NUMBER
-          if ($runNumber -le 0) {
-            throw "GITHUB_RUN_NUMBER must be a positive integer"
+          if ($env:GITHUB_REF_TYPE -ne "tag") {
+            throw "Publish workflow must run from a vX.Y.Z tag; got $env:GITHUB_REF_TYPE '$env:GITHUB_REF_NAME'"
           }
 
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $tagName = $env:GITHUB_REF_NAME
+          if ($tagName -notmatch '^v(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$') {
+            throw "Release tag '$tagName' must match vX.Y.Z"
+          }
+          $tagVersion = $Matches.version
 
-          foreach ($package in $metadata.packages) {
-            if ($package.publish -eq $false) {
-              Write-Host "Skipping $($package.name) because publish=false"
-              continue
-            }
-
-            $name = $package.name
-            $manifestPath = $package.manifest_path
-            $currentVersion = [string] $package.version
-
-            if ($currentVersion -notmatch '^(?<major>0|[1-9][0-9]*)\.(?<minor>0|[1-9][0-9]*)\.(?<patch>0|[1-9][0-9]*)$') {
-              throw "Cannot auto-bump $name version '$currentVersion'; expected major.minor.patch"
-            }
-
-            $newVersion = "$($Matches.major).$($Matches.minor).$runNumber"
-            $manifest = Get-Content -Raw -Path $manifestPath
-            $versionPattern = '(?m)^(\s*version\s*=\s*)"' + [regex]::Escape($currentVersion) + '"'
-            $versionRegex = [regex] $versionPattern
-            $updated = $versionRegex.Replace($manifest, '${1}"' + $newVersion + '"', 1)
-
-            if ($updated -eq $manifest) {
-              throw "Failed to update version for $name in $manifestPath"
-            }
-
-            Set-Content -Path $manifestPath -Value $updated -NoNewline
-            Write-Host "Set $name version from $currentVersion to $newVersion"
+          $inputVersion = "${{ github.event.inputs.version }}"
+          if (-not [string]::IsNullOrWhiteSpace($inputVersion) -and $inputVersion -ne $tagVersion) {
+            throw "workflow_dispatch version '$inputVersion' does not match tag '$tagName'"
           }
 
-          cargo update --workspace
+          git diff --exit-code
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release publish must run from a clean checkout"
+          }
+
+          git diff --cached --exit-code
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release publish must run with no staged changes"
+          }
+
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $packages = @($metadata.packages | Where-Object { $_.publish -ne $false })
+          if ($packages.Count -eq 0) {
+            throw "No publishable packages found"
+          }
+
+          foreach ($package in $packages) {
+            if ([string] $package.version -ne $tagVersion) {
+              throw "Package $($package.name) version $($package.version) does not match release tag $tagName"
+            }
+          }
+
+          Write-Host "Release tag $tagName matches committed package version $tagVersion"
 
       - name: Discover unpublished versions
         id: discover
@@ -74,7 +80,7 @@ jobs:
           New-Item -ItemType File -Force -Path $packageList | Out-Null
           Clear-Content -Path $packageList
 
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
           $unpublishedCount = 0
 
           foreach ($package in $metadata.packages) {
@@ -148,5 +154,5 @@ jobs:
           $packageList = "${{ steps.discover.outputs.package_list }}"
           foreach ($name in Get-Content -Path $packageList) {
             Write-Host "Publishing $name"
-            cargo publish --locked --no-verify --package $name
+            cargo publish --locked --package $name
           }
