@@ -1,12 +1,15 @@
 //! ContextAssemblyService — turns a RetrievalRun into a token-budgeted RetrievedContext and
-//! renders it into an LlmRequest (answer-generation.md). Pure: no external calls. Eligibility uses
-//! the same `SIMILARITY_THRESHOLD` as search/eval — single source of truth (ADR-0003/0006, C4).
+//! renders it into an LlmRequest (answer-generation.md). Pure: no external calls. Eligibility is
+//! mode-aware: the vector similarity threshold applies only to vector-mode scores.
 
 use crate::answer_generation::domain::context::{ContextChunk, RetrievedContext};
 use crate::answer_generation::domain::prompt_template::PromptTemplate;
 use crate::answer_generation::ports::LlmRequest;
-use crate::retrieval::application::scoring::SIMILARITY_THRESHOLD;
+use crate::retrieval::application::scoring::score_clears_similarity_threshold;
 use crate::retrieval::domain::RetrievalRun;
+
+// M5: the numeric similarity threshold is calibrated for vector scores only.
+// Keyword and hybrid relevance scores pass through this gate unless there are no results.
 
 /// Default context budget (whitespace-word estimate). Previews are short, so this rarely binds;
 /// the trim logic (E7) exists so an over-large context can never blow the prompt.
@@ -17,14 +20,13 @@ fn estimate_tokens(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
-/// Build the context from the run's eligible results (score ≥ threshold), rank-ordered, trimmed
-/// to `max_tokens` by dropping the lowest-rank chunks first (E7). Keeps at least one chunk if any
-/// is eligible. An empty result is the weak-retrieval signal the service refuses on (AC-2).
+/// Build the context from the run's eligible results, rank-ordered, trimmed to `max_tokens` by
+/// dropping the lowest-rank chunks first (E7). Keeps at least one chunk if any is eligible.
 pub fn assemble(run: &RetrievalRun, max_tokens: usize) -> RetrievedContext {
     let mut chunks: Vec<ContextChunk> = run
         .results
         .iter()
-        .filter(|r| r.score >= SIMILARITY_THRESHOLD)
+        .filter(|r| score_clears_similarity_threshold(run.search_mode, r.score))
         .map(|r| ContextChunk {
             rank: r.rank,
             chunk_id: r.chunk_id.clone(),
@@ -42,7 +44,10 @@ pub fn assemble(run: &RetrievalRun, max_tokens: usize) -> RetrievedContext {
         }
     }
 
-    RetrievedContext { query_text: run.query.text.clone(), chunks }
+    RetrievedContext {
+        query_text: run.query.text.clone(),
+        chunks,
+    }
 }
 
 /// Render the context into a prompt. Each chunk is tagged `[[chunk:<id>]]` so the LLM can cite by
@@ -57,7 +62,10 @@ pub fn render(template: &PromptTemplate, ctx: &RetrievedContext, max_tokens: usi
             } else {
                 format!(" [{}]", c.heading_path.join(" > "))
             };
-            format!("[[chunk:{}]] (source={}){}\n{}", c.chunk_id, c.source_path, heading, c.text)
+            format!(
+                "[[chunk:{}]] (source={}){}\n{}",
+                c.chunk_id, c.source_path, heading, c.text
+            )
         })
         .collect::<Vec<_>>()
         .join("\n\n");
@@ -79,11 +87,17 @@ mod tests {
     use super::*;
     use crate::answer_generation::domain::prompt_template;
     use crate::ingestion::domain::EmbeddingModelVersion;
-    use crate::retrieval::domain::{MetadataFilter, Query, RetrievalResult, RetrievalRun, RunReason, SearchMode};
+    use crate::retrieval::domain::{
+        MetadataFilter, Query, RetrievalResult, RetrievalRun, RunReason, SearchMode,
+    };
     use std::collections::BTreeMap;
 
     fn model() -> EmbeddingModelVersion {
-        EmbeddingModelVersion { name: "mock".into(), dimension: 8, created_at: "t".into() }
+        EmbeddingModelVersion {
+            name: "mock".into(),
+            dimension: 8,
+            created_at: "t".into(),
+        }
     }
 
     fn res(rank: usize, chunk: &str, score: f32, text: &str) -> RetrievalResult {
@@ -100,17 +114,21 @@ mod tests {
     }
 
     fn run_with(results: Vec<RetrievalResult>) -> RetrievalRun {
+        run_with_mode(SearchMode::Vector, results)
+    }
+
+    fn run_with_mode(mode: SearchMode, results: Vec<RetrievalResult>) -> RetrievalRun {
         RetrievalRun {
             id: "rr".into(),
             query: Query {
                 text: "what is layering".into(),
-                mode: SearchMode::Vector,
+                mode,
                 filters: MetadataFilter::default(),
                 top_k: 5,
                 embedding_model: model(),
             },
             results,
-            search_mode: SearchMode::Vector,
+            search_mode: mode,
             top_k: 5,
             latency_ms: 1,
             below_threshold_count: 0,
@@ -127,6 +145,14 @@ mod tests {
             res(1, "c1", 0.90, "alpha"),
             res(2, "c2", 0.10, "beta"), // below 0.30 → excluded
         ]);
+        let ctx = assemble(&run, MAX_CONTEXT_TOKENS);
+        let ids: Vec<&str> = ctx.chunks.iter().map(|c| c.chunk_id.as_str()).collect();
+        assert_eq!(ids, vec!["c1"]);
+    }
+
+    #[test]
+    fn assemble_does_not_apply_vector_threshold_to_keyword_runs() {
+        let run = run_with_mode(SearchMode::Keyword, vec![res(1, "c1", 0.10, "lexical hit")]);
         let ctx = assemble(&run, MAX_CONTEXT_TOKENS);
         let ids: Vec<&str> = ctx.chunks.iter().map(|c| c.chunk_id.as_str()).collect();
         assert_eq!(ids, vec!["c1"]);

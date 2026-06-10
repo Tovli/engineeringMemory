@@ -20,6 +20,19 @@ pub struct RawSearchResult {
     pub metadata: std::collections::BTreeMap<String, String>,
 }
 
+/// ACL-internal lexical candidate returned by keyword search. `raw_score` is
+/// provider-specific and normalized by the application before becoming a domain score.
+#[derive(Debug, Clone)]
+pub struct RawKeywordSearchResult {
+    pub chunk_id: String,
+    pub document_id: String,
+    pub source_path: String,
+    pub raw_score: f32,
+    pub preview: String,
+    pub heading_path: Vec<String>,
+    pub metadata: std::collections::BTreeMap<String, String>,
+}
+
 /// Document metadata needed to apply project/tag filters and drop deleted docs (ADR-0002).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocMeta {
@@ -34,6 +47,11 @@ pub trait VectorSearchPort {
     /// Top-`k` nearest neighbours by cosine distance. No native metadata filter is applied
     /// (filtering is done in the application layer — ADR-0002); over-fetch happens in the caller.
     fn vector_search(&self, query_vec: &[f32], k: usize) -> anyhow::Result<Vec<RawSearchResult>>;
+}
+
+/// Read-only lexical search over the local keyword index Ingestion populated.
+pub trait KeywordSearchPort {
+    fn keyword_search(&self, query: &str, k: usize) -> anyhow::Result<Vec<RawKeywordSearchResult>>;
 }
 
 /// Read-only document metadata lookup (over `documents.redb`).

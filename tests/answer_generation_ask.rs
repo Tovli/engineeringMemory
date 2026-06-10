@@ -21,6 +21,7 @@ use tovli::ingestion::ports::Embedder;
 
 use tovli::retrieval::application::SearchService;
 use tovli::retrieval::domain::{MetadataFilter, Query, SearchMode};
+use tovli::retrieval::infra::redb_keyword_search::RedbKeywordSearch;
 use tovli::retrieval::infra::redb_lookup::RedbDocumentLookup;
 use tovli::retrieval::infra::ruvector_search::RuVectorSearchAdapter;
 use tovli::retrieval::ports::DocumentLookupPort;
@@ -47,10 +48,19 @@ impl Paths {
         self.base.join("vectors.redb").to_string_lossy().to_string()
     }
     fn chunkmap(&self) -> String {
-        self.base.join("chunkmap.redb").to_string_lossy().to_string()
+        self.base
+            .join("chunkmap.redb")
+            .to_string_lossy()
+            .to_string()
     }
     fn documents(&self) -> String {
-        self.base.join("documents.redb").to_string_lossy().to_string()
+        self.base
+            .join("documents.redb")
+            .to_string_lossy()
+            .to_string()
+    }
+    fn keyword(&self) -> String {
+        self.base.join("keyword.redb").to_string_lossy().to_string()
     }
 }
 
@@ -69,6 +79,7 @@ fn ingest(paths: &Paths, dir: &Path) {
         parsers: &parsers,
         embedder: &emb,
         store: &store,
+        keyword_index: None,
         docs: &docs,
         chunking: ChunkingService::new(ChunkingConfig::default()),
     };
@@ -98,30 +109,59 @@ fn end_to_end_ask_generates_a_cited_grounded_answer() {
     let lookup = RedbDocumentLookup::open(&paths.documents()).unwrap();
     let dim = lookup.indexed_model_version().unwrap().unwrap().dimension;
     let store = RuVectorSearchAdapter::open(&paths.vectors(), dim).unwrap();
-    let search = SearchService { embedder: &MockEmbedder::new(DIM), store: &store, lookup: &lookup };
+    let keyword = RedbKeywordSearch::open(&paths.keyword()).unwrap();
+    let search = SearchService {
+        embedder: &MockEmbedder::new(DIM),
+        store: &store,
+        keyword: &keyword,
+        lookup: &lookup,
+    };
 
     // Query text == chunk content → mock embeds identically → similarity ≈ 1.0 clears threshold.
     let run = search.search(&query(body), false, "rrun_it", NOW).unwrap();
-    assert!(!run.results.is_empty(), "the ingested chunk should be retrieved");
+    assert!(
+        !run.results.is_empty(),
+        "the ingested chunk should be retrieved"
+    );
 
     let llm = MockLlm::default();
     let rag = RagAnswerService { llm: &llm };
-    let actx = AnswerContext { query_id: "qry_it", answer_id: "ans_it", now: NOW, max_tokens: 256 };
+    let actx = AnswerContext {
+        query_id: "qry_it",
+        answer_id: "ans_it",
+        now: NOW,
+        max_tokens: 256,
+    };
     let answer = rag.generate(&run, &actx);
 
-    assert!(answer.no_answer_reason.is_none(), "expected a grounded answer, got {:?}", answer.no_answer_reason);
-    assert!(!answer.citations.is_empty(), "a grounded answer must cite at least one source");
+    assert!(
+        answer.no_answer_reason.is_none(),
+        "expected a grounded answer, got {:?}",
+        answer.no_answer_reason
+    );
+    assert!(
+        !answer.citations.is_empty(),
+        "a grounded answer must cite at least one source"
+    );
     assert!(answer.invariant_holds());
     assert_eq!(answer.llm_provider, "mock-llm");
     assert_eq!(answer.prompt_template_version, "v1.0.0"); // AC-4
-    // Every citation refers to a chunk that was actually retrieved (AC-6: no invented citations).
+                                                          // Every citation refers to a chunk that was actually retrieved (AC-6: no invented citations).
     let retrieved: Vec<&str> = run.results.iter().map(|r| r.chunk_id.as_str()).collect();
     for c in &answer.citations {
-        assert!(retrieved.contains(&c.chunk_id.as_str()), "citation {} not in the run", c.chunk_id);
+        assert!(
+            retrieved.contains(&c.chunk_id.as_str()),
+            "citation {} not in the run",
+            c.chunk_id
+        );
     }
 
     // R9/AC-4: the answer log is appended as JSON with the prompt version recorded.
-    let log = paths.base.join("answers.jsonl").to_string_lossy().to_string();
+    let log = paths
+        .base
+        .join("answers.jsonl")
+        .to_string_lossy()
+        .to_string();
     append_answer_log(&log, &answer).unwrap();
     let line = std::fs::read_to_string(&log).unwrap();
     let logged: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();

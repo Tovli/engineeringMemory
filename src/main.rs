@@ -4,32 +4,38 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use tovli::answer_generation::application::rag_service::{AnswerContext, RagAnswerService};
+use tovli::answer_generation::domain::answer::{Answer, NoAnswerReason};
+use tovli::answer_generation::infra::answer_log_writer::append_answer_log;
+use tovli::answer_generation::infra::mock_llm::MockLlm;
+use tovli::evaluation::application::EvaluationService;
+use tovli::evaluation::domain::{EvalRun, EvalRunConfig, EvalRunStatus, ThresholdConfig};
+use tovli::evaluation::infra::dataset_loader::load_dataset;
+use tovli::evaluation::infra::report_writer::write_report;
+use tovli::evaluation::infra::retrieval_search_adapter::RetrievalSearchAdapter;
 use tovli::ingestion::chunking::ChunkingService;
 use tovli::ingestion::domain::{ChunkingConfig, IngestionSummary};
 use tovli::ingestion::infra::mock_embedder::MockEmbedder;
 use tovli::ingestion::infra::parsers::default_parsers;
+use tovli::ingestion::infra::redb_keyword_index::RedbKeywordIndex;
 use tovli::ingestion::infra::redb_repo::RedbDocumentRepository;
 use tovli::ingestion::infra::ruvector_store::RuVectorStoreAdapter;
 use tovli::ingestion::orchestrator::{IngestOptions, IngestionOrchestrator};
 use tovli::ingestion::ports::Embedder;
 use tovli::retrieval::application::SearchService;
 use tovli::retrieval::domain::{MetadataFilter, Query, RetrievalRun, RunReason, SearchMode};
+use tovli::retrieval::infra::redb_keyword_search::RedbKeywordSearch;
 use tovli::retrieval::infra::redb_lookup::RedbDocumentLookup;
 use tovli::retrieval::infra::ruvector_search::RuVectorSearchAdapter;
 use tovli::retrieval::ports::DocumentLookupPort;
-use tovli::evaluation::application::EvaluationService;
-use tovli::evaluation::domain::{EvalRun, EvalRunConfig, EvalRunStatus, ThresholdConfig};
-use tovli::evaluation::infra::dataset_loader::load_dataset;
-use tovli::evaluation::infra::report_writer::write_report;
-use tovli::evaluation::infra::retrieval_search_adapter::RetrievalSearchAdapter;
-use tovli::answer_generation::application::rag_service::{AnswerContext, RagAnswerService};
-use tovli::answer_generation::domain::answer::{Answer, NoAnswerReason};
-use tovli::answer_generation::infra::answer_log_writer::append_answer_log;
-use tovli::answer_generation::infra::mock_llm::MockLlm;
 use tovli::vector_store::{Doc, RuVectorStore, VectorStore};
 
 #[derive(Parser)]
-#[command(name = "tovli", about = "RuVector-based technical memory assistant", version)]
+#[command(
+    name = "tovli",
+    about = "RuVector-based technical memory assistant",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -77,7 +83,7 @@ struct SearchArgs {
     /// Maximum number of results to return.
     #[arg(long = "top-k", default_value_t = 8)]
     top_k: usize,
-    /// Search mode. Only `vector` is available in Milestone 2 (keyword/hybrid arrive in M5).
+    /// Search mode.
     #[arg(long, default_value = "vector")]
     mode: String,
     /// Only return chunks from documents in this project.
@@ -101,7 +107,7 @@ struct SearchArgs {
 struct EvalArgs {
     /// Path to the evaluation questions JSON.
     path: PathBuf,
-    /// Search mode. Only `vector` is available until Milestone 5.
+    /// Search mode.
     #[arg(long, default_value = "vector")]
     mode: String,
     /// Retrieval depth per question (at least 5 is used internally so Hit@5/MRR are computable).
@@ -125,7 +131,7 @@ struct AskArgs {
     /// Maximum number of chunks to retrieve as context.
     #[arg(long = "top-k", default_value_t = 8)]
     top_k: usize,
-    /// Search mode. Only `vector` is available until Milestone 5.
+    /// Search mode.
     #[arg(long, default_value = "vector")]
     mode: String,
     /// Run retrieval only — print the context and skip answer generation (no LLM call).
@@ -140,6 +146,7 @@ struct AskArgs {
 }
 
 const STORE_DIR: &str = ".tovli";
+const KEYWORD_INDEX_FILE: &str = "keyword.redb";
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
@@ -167,6 +174,16 @@ fn build_embedder(_mock: bool) -> anyhow::Result<Box<dyn Embedder>> {
     Ok(Box::new(MockEmbedder::new(384)))
 }
 
+fn parse_mode_or_exit(raw: &str) -> SearchMode {
+    match raw.parse::<SearchMode>() {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn run_ingest(args: IngestArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(STORE_DIR)?;
 
@@ -180,6 +197,7 @@ fn run_ingest(args: IngestArgs) -> anyhow::Result<()> {
         dim,
     )?;
     let docs = RedbDocumentRepository::open(&format!("{STORE_DIR}/documents.redb"))?;
+    let keyword_index = RedbKeywordIndex::open(&format!("{STORE_DIR}/{KEYWORD_INDEX_FILE}"))?;
     let parsers = default_parsers();
     let config = ChunkingConfig::default();
     config.validate().map_err(|e| anyhow::anyhow!(e))?;
@@ -188,6 +206,7 @@ fn run_ingest(args: IngestArgs) -> anyhow::Result<()> {
         parsers: &parsers,
         embedder: embedder.as_ref(),
         store: &store,
+        keyword_index: Some(&keyword_index),
         docs: &docs,
         chunking: ChunkingService::new(config),
     };
@@ -205,7 +224,10 @@ fn run_ingest(args: IngestArgs) -> anyhow::Result<()> {
 }
 
 fn print_summary(s: &IngestionSummary, config: &ChunkingConfig) {
-    println!("\n== ingestion summary{} ==", if s.dry_run { " (dry-run)" } else { "" });
+    println!(
+        "\n== ingestion summary{} ==",
+        if s.dry_run { " (dry-run)" } else { "" }
+    );
     println!(
         "chunking: target={} max={} overlap={} tokens",
         config.target_tokens, config.max_tokens, config.overlap_tokens
@@ -237,18 +259,19 @@ fn print_summary(s: &IngestionSummary, config: &ChunkingConfig) {
 // ---------------------------------------------------------------------------
 
 fn run_search(args: SearchArgs) -> anyhow::Result<()> {
-    if args.mode != "vector" {
-        eprintln!("mode '{}' is available in Milestone 5; use --mode vector", args.mode);
-        std::process::exit(2);
-    }
+    let mode = parse_mode_or_exit(&args.mode);
 
     let embedder = build_embedder(args.mock)?;
     let model = embedder.model_version().clone();
 
     let query = Query {
         text: args.query,
-        mode: SearchMode::Vector,
-        filters: MetadataFilter { project: args.project, tags: args.tags, source: args.source },
+        mode,
+        filters: MetadataFilter {
+            project: args.project,
+            tags: args.tags,
+            source: args.source,
+        },
         top_k: args.top_k,
         embedding_model: model,
     };
@@ -262,9 +285,16 @@ fn run_search(args: SearchArgs) -> anyhow::Result<()> {
         println!("index is empty — run `tovli ingest <folder>` first");
         return Ok(());
     };
-    let store = RuVectorSearchAdapter::open(&format!("{STORE_DIR}/vectors.redb"), indexed.dimension)?;
+    let store =
+        RuVectorSearchAdapter::open(&format!("{STORE_DIR}/vectors.redb"), indexed.dimension)?;
+    let keyword = RedbKeywordSearch::open(&format!("{STORE_DIR}/{KEYWORD_INDEX_FILE}"))?;
 
-    let svc = SearchService { embedder: embedder.as_ref(), store: &store, lookup: &lookup };
+    let svc = SearchService {
+        embedder: embedder.as_ref(),
+        store: &store,
+        keyword: &keyword,
+        lookup: &lookup,
+    };
     let run_id = format!("rrun_{}", chrono::Utc::now().timestamp_millis());
     let now = chrono::Utc::now().to_rfc3339();
     let run = svc.search(&query, args.explain, &run_id, &now)?; // mismatch (AC-7) surfaces here
@@ -290,7 +320,10 @@ fn render_filters(f: &MetadataFilter) -> String {
 }
 
 fn print_header(query: &Query) {
-    println!("query  : \"{}\"   mode={}  top-k={}", query.text, query.mode, query.top_k);
+    println!(
+        "query  : \"{}\"   mode={}  top-k={}",
+        query.text, query.mode, query.top_k
+    );
     println!("filters: {}", render_filters(&query.filters));
 }
 
@@ -301,7 +334,11 @@ fn print_results(run: &RetrievalRun) {
         return;
     }
     if run.results.is_empty() {
-        let suffix = if run.query.filters.is_empty() { "" } else { " for these filters" };
+        let suffix = if run.query.filters.is_empty() {
+            ""
+        } else {
+            " for these filters"
+        };
         println!("no results{suffix}");
         return;
     }
@@ -313,21 +350,31 @@ fn print_results(run: &RetrievalRun) {
         let first_line = r.preview.lines().next().unwrap_or("");
         println!("      {first_line}   [{}]", r.chunk_id);
     }
-    println!("\nlatency: {} ms   below-threshold: {}", run.latency_ms, run.below_threshold_count);
+    println!(
+        "\nlatency: {} ms   below-threshold: {}",
+        run.latency_ms, run.below_threshold_count
+    );
     if let Some(ex) = &run.explain {
         println!("\n== explain ==");
-        println!("provider     : {} (dim {})", ex.query_embedding_provider, ex.query_embedding_dimension);
+        println!(
+            "provider     : {} (dim {})",
+            ex.query_embedding_provider, ex.query_embedding_dimension
+        );
         println!("search mode  : {}", ex.search_mode);
         println!("ranking      : {}", ex.ranking_method);
         println!("filters      : {}", render_filters(&ex.filters_applied));
         for d in &ex.result_details {
+            let vector = d
+                .vector_score
+                .map(|s| format!("{s:.4}"))
+                .unwrap_or_else(|| "-".to_string());
+            let keyword = d
+                .keyword_score
+                .map(|s| format!("{s:.4}"))
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "  #{:<2} chunk={} vector={:.4} fused={:.4} :: {}",
-                d.rank,
-                d.chunk_id,
-                d.vector_score.unwrap_or(0.0),
-                d.fused_score,
-                d.eligibility_reason
+                "  #{:<2} chunk={} vector={} keyword={} fused={:.4} :: {}",
+                d.rank, d.chunk_id, vector, keyword, d.fused_score, d.eligibility_reason
             );
         }
     }
@@ -338,10 +385,7 @@ fn print_results(run: &RetrievalRun) {
 // ---------------------------------------------------------------------------
 
 fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
-    if args.mode != "vector" {
-        eprintln!("mode '{}' is available in Milestone 5; use --mode vector", args.mode);
-        std::process::exit(2);
-    }
+    let mode = parse_mode_or_exit(&args.mode);
     let dataset_path = args.path.to_string_lossy().to_string();
     let questions = load_dataset(&dataset_path)?;
 
@@ -349,17 +393,28 @@ fn run_eval(args: EvalArgs) -> anyhow::Result<()> {
     let model = embedder.model_version().clone();
 
     let lookup = RedbDocumentLookup::open(&format!("{STORE_DIR}/documents.redb"))?;
-    let dim = lookup.indexed_model_version()?.map(|m| m.dimension).unwrap_or(model.dimension);
+    let dim = lookup
+        .indexed_model_version()?
+        .map(|m| m.dimension)
+        .unwrap_or(model.dimension);
     let store = RuVectorSearchAdapter::open(&format!("{STORE_DIR}/vectors.redb"), dim)?;
+    let keyword = RedbKeywordSearch::open(&format!("{STORE_DIR}/{KEYWORD_INDEX_FILE}"))?;
 
-    let search = SearchService { embedder: embedder.as_ref(), store: &store, lookup: &lookup };
+    let search = SearchService {
+        embedder: embedder.as_ref(),
+        store: &store,
+        keyword: &keyword,
+        lookup: &lookup,
+    };
     let adapter = RetrievalSearchAdapter { inner: search };
     let evaluator = EvaluationService { search: &adapter };
 
     let config = EvalRunConfig {
-        mode: SearchMode::Vector,
+        mode,
         top_k: args.top_k,
-        threshold: ThresholdConfig { min_hit_at_3: args.fail_below_hit_at_3 },
+        threshold: ThresholdConfig {
+            min_hit_at_3: args.fail_below_hit_at_3,
+        },
         embedding_model: model,
     };
     let run_id = format!("ev_{}", chrono::Utc::now().timestamp_millis());
@@ -392,9 +447,15 @@ fn print_eval(run: &EvalRun) {
     println!("== evaluation ==");
     println!("dataset        : {}", run.dataset_path);
     println!("mode           : {}  top-k={}", run.search_mode, run.top_k);
-    println!("model          : {} (dim {})", run.embedding_model.name, run.embedding_model.dimension);
+    println!(
+        "model          : {} (dim {})",
+        run.embedding_model.name, run.embedding_model.dimension
+    );
     println!("questions      : {}", m.question_count);
-    println!("Hit@1/3/5      : {:.2} / {:.2} / {:.2}", m.hit_at_1, m.hit_at_3, m.hit_at_5);
+    println!(
+        "Hit@1/3/5      : {:.2} / {:.2} / {:.2}",
+        m.hit_at_1, m.hit_at_3, m.hit_at_5
+    );
     println!("MRR            : {:.3}", m.mrr);
     println!("avg latency    : {:.1} ms", m.avg_latency_ms);
     println!("empty results  : {}", m.empty_result_count);
@@ -407,17 +468,14 @@ fn print_eval(run: &EvalRun) {
 // ---------------------------------------------------------------------------
 
 fn run_ask(args: AskArgs) -> anyhow::Result<()> {
-    if args.mode != "vector" {
-        eprintln!("mode '{}' is available in Milestone 5; use --mode vector", args.mode);
-        std::process::exit(2);
-    }
+    let mode = parse_mode_or_exit(&args.mode);
 
     let embedder = build_embedder(args.mock)?;
     let model = embedder.model_version().clone();
 
     let query = Query {
         text: args.query,
-        mode: SearchMode::Vector,
+        mode,
         filters: MetadataFilter::default(),
         top_k: args.top_k,
         embedding_model: model,
@@ -430,9 +488,16 @@ fn run_ask(args: AskArgs) -> anyhow::Result<()> {
         println!("index is empty — run `tovli ingest <folder>` first");
         return Ok(());
     };
-    let store = RuVectorSearchAdapter::open(&format!("{STORE_DIR}/vectors.redb"), indexed.dimension)?;
+    let store =
+        RuVectorSearchAdapter::open(&format!("{STORE_DIR}/vectors.redb"), indexed.dimension)?;
+    let keyword = RedbKeywordSearch::open(&format!("{STORE_DIR}/{KEYWORD_INDEX_FILE}"))?;
 
-    let svc = SearchService { embedder: embedder.as_ref(), store: &store, lookup: &lookup };
+    let svc = SearchService {
+        embedder: embedder.as_ref(),
+        store: &store,
+        keyword: &keyword,
+        lookup: &lookup,
+    };
     let ts = chrono::Utc::now().timestamp_millis();
     let now = chrono::Utc::now().to_rfc3339();
     let run = svc.search(&query, false, &format!("rrun_{ts}"), &now)?; // model mismatch surfaces here
@@ -449,7 +514,12 @@ fn run_ask(args: AskArgs) -> anyhow::Result<()> {
     let rag = RagAnswerService { llm: &llm };
     let query_id = format!("qry_{ts}");
     let answer_id = format!("ans_{ts}");
-    let actx = AnswerContext { query_id: &query_id, answer_id: &answer_id, now: &now, max_tokens: 512 };
+    let actx = AnswerContext {
+        query_id: &query_id,
+        answer_id: &answer_id,
+        now: &now,
+        max_tokens: 512,
+    };
     let answer = rag.generate(&run, &actx);
     print_answer(&answer);
     append_answer_log(&format!("{STORE_DIR}/answers.jsonl"), &answer)?;
@@ -469,7 +539,10 @@ fn print_context(run: &RetrievalRun) {
         return;
     }
     for r in &run.results {
-        println!("#{:<2} score={:.4}  {}  [{}]", r.rank, r.score, r.source_path, r.chunk_id);
+        println!(
+            "#{:<2} score={:.4}  {}  [{}]",
+            r.rank, r.score, r.source_path, r.chunk_id
+        );
         let first_line = r.preview.lines().next().unwrap_or("");
         if !first_line.is_empty() {
             println!("      {first_line}");
@@ -489,7 +562,10 @@ fn print_answer(answer: &Answer) {
             }
         }
     }
-    println!("\nprompt: {}   provider: {}", answer.prompt_template_version, answer.llm_provider);
+    println!(
+        "\nprompt: {}   provider: {}",
+        answer.prompt_template_version, answer.llm_provider
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -505,12 +581,48 @@ fn sample_docs() -> Vec<Doc> {
         source: source.to_string(),
     };
     vec![
-        mk("doc-arch-1", [1.0, 0.0, 0.0, 0.1], "Architecture layering rules", "architecture", "docs/architecture.md"),
-        mk("doc-arch-2", [0.9, 0.1, 0.0, 0.0], "Component vs deployment boundaries", "architecture", "docs/boundaries.md"),
-        mk("doc-deploy-1", [0.0, 1.0, 0.0, 0.1], "Azure Function zipDeploy 403", "deployment", "docs/deploy-azure.md"),
-        mk("doc-deploy-2", [0.1, 0.9, 0.0, 0.0], "GitHub Actions npm ci failure", "deployment", "docs/deploy-ci.md"),
-        mk("doc-auth-1", [0.0, 0.0, 1.0, 0.1], "Firebase auth migration", "auth", "docs/auth-firebase.md"),
-        mk("doc-auth-2", [0.0, 0.1, 0.9, 0.0], "Token refresh conventions", "auth", "docs/auth-tokens.md"),
+        mk(
+            "doc-arch-1",
+            [1.0, 0.0, 0.0, 0.1],
+            "Architecture layering rules",
+            "architecture",
+            "docs/architecture.md",
+        ),
+        mk(
+            "doc-arch-2",
+            [0.9, 0.1, 0.0, 0.0],
+            "Component vs deployment boundaries",
+            "architecture",
+            "docs/boundaries.md",
+        ),
+        mk(
+            "doc-deploy-1",
+            [0.0, 1.0, 0.0, 0.1],
+            "Azure Function zipDeploy 403",
+            "deployment",
+            "docs/deploy-azure.md",
+        ),
+        mk(
+            "doc-deploy-2",
+            [0.1, 0.9, 0.0, 0.0],
+            "GitHub Actions npm ci failure",
+            "deployment",
+            "docs/deploy-ci.md",
+        ),
+        mk(
+            "doc-auth-1",
+            [0.0, 0.0, 1.0, 0.1],
+            "Firebase auth migration",
+            "auth",
+            "docs/auth-firebase.md",
+        ),
+        mk(
+            "doc-auth-2",
+            [0.0, 0.1, 0.9, 0.0],
+            "Token refresh conventions",
+            "auth",
+            "docs/auth-tokens.md",
+        ),
     ]
 }
 
@@ -551,9 +663,18 @@ fn run_spike() -> anyhow::Result<()> {
     let scores_sorted = hits.windows(2).all(|w| w[0].score <= w[1].score + 1e-6);
     let checks: Vec<(&str, bool)> = vec![
         ("count == 6", count == 6),
-        ("top-1 is doc-arch-2", hits.first().map(|h| h.id.as_str()) == Some("doc-arch-2")),
-        ("top-2 is doc-arch-1", hits.get(1).map(|h| h.id.as_str()) == Some("doc-arch-1")),
-        ("top-2 both architecture", hits.iter().take(2).all(|h| h.topic == "architecture")),
+        (
+            "top-1 is doc-arch-2",
+            hits.first().map(|h| h.id.as_str()) == Some("doc-arch-2"),
+        ),
+        (
+            "top-2 is doc-arch-1",
+            hits.get(1).map(|h| h.id.as_str()) == Some("doc-arch-1"),
+        ),
+        (
+            "top-2 both architecture",
+            hits.iter().take(2).all(|h| h.topic == "architecture"),
+        ),
         ("scores non-decreasing", scores_sorted),
     ];
 

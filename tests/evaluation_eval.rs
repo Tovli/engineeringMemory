@@ -11,6 +11,7 @@ use tovli::ingestion::chunking::ChunkingService;
 use tovli::ingestion::domain::ChunkingConfig;
 use tovli::ingestion::infra::mock_embedder::MockEmbedder;
 use tovli::ingestion::infra::parsers::default_parsers;
+use tovli::ingestion::infra::redb_keyword_index::RedbKeywordIndex;
 use tovli::ingestion::infra::redb_repo::RedbDocumentRepository;
 use tovli::ingestion::infra::ruvector_store::RuVectorStoreAdapter;
 use tovli::ingestion::orchestrator::{IngestOptions, IngestionOrchestrator};
@@ -18,6 +19,7 @@ use tovli::ingestion::ports::Embedder;
 
 use tovli::retrieval::application::SearchService;
 use tovli::retrieval::domain::SearchMode;
+use tovli::retrieval::infra::redb_keyword_search::RedbKeywordSearch;
 use tovli::retrieval::infra::redb_lookup::RedbDocumentLookup;
 use tovli::retrieval::infra::ruvector_search::RuVectorSearchAdapter;
 use tovli::retrieval::ports::DocumentLookupPort;
@@ -46,10 +48,19 @@ impl Paths {
         self.base.join("vectors.redb").to_string_lossy().to_string()
     }
     fn chunkmap(&self) -> String {
-        self.base.join("chunkmap.redb").to_string_lossy().to_string()
+        self.base
+            .join("chunkmap.redb")
+            .to_string_lossy()
+            .to_string()
     }
     fn documents(&self) -> String {
-        self.base.join("documents.redb").to_string_lossy().to_string()
+        self.base
+            .join("documents.redb")
+            .to_string_lossy()
+            .to_string()
+    }
+    fn keyword(&self) -> String {
+        self.base.join("keyword.redb").to_string_lossy().to_string()
     }
 }
 
@@ -68,6 +79,24 @@ fn ingest(paths: &Paths, dir: &Path) {
         parsers: &parsers,
         embedder: &emb,
         store: &store,
+        keyword_index: None,
+        docs: &docs,
+        chunking: ChunkingService::new(ChunkingConfig::default()),
+    };
+    orch.ingest(dir, &IngestOptions::default(), NOW).unwrap();
+}
+
+fn ingest_with_keyword(paths: &Paths, dir: &Path) {
+    let store = RuVectorStoreAdapter::open(&paths.vectors(), &paths.chunkmap(), DIM).unwrap();
+    let docs = RedbDocumentRepository::open(&paths.documents()).unwrap();
+    let keyword = RedbKeywordIndex::open(&paths.keyword()).unwrap();
+    let parsers = default_parsers();
+    let emb = MockEmbedder::new(DIM);
+    let orch = IngestionOrchestrator {
+        parsers: &parsers,
+        embedder: &emb,
+        store: &store,
+        keyword_index: Some(&keyword),
         docs: &docs,
         chunking: ChunkingService::new(ChunkingConfig::default()),
     };
@@ -84,10 +113,16 @@ fn question(id: &str, source: &str) -> EvalQuestion {
 }
 
 fn config(threshold: Option<f64>) -> EvalRunConfig {
+    config_with_mode(SearchMode::Vector, threshold)
+}
+
+fn config_with_mode(mode: SearchMode, threshold: Option<f64>) -> EvalRunConfig {
     EvalRunConfig {
-        mode: SearchMode::Vector,
+        mode,
         top_k: 5,
-        threshold: ThresholdConfig { min_hit_at_3: threshold },
+        threshold: ThresholdConfig {
+            min_hit_at_3: threshold,
+        },
         embedding_model: MockEmbedder::new(DIM).model_version().clone(),
     }
 }
@@ -98,23 +133,44 @@ fn end_to_end_eval_computes_metrics_and_writes_report() {
     let paths = Paths::new();
     let dir = paths.base.join("docs");
     {
-        write(&dir, "arch.md", "# Architecture\n\nlayering rules and component boundaries\n");
-        write(&dir, "deploy.md", "# Deploy\n\nazure function zipDeploy 403 during release\n");
+        write(
+            &dir,
+            "arch.md",
+            "# Architecture\n\nlayering rules and component boundaries\n",
+        );
+        write(
+            &dir,
+            "deploy.md",
+            "# Deploy\n\nazure function zipDeploy 403 during release\n",
+        );
         ingest(&paths, &dir);
     }
 
     let lookup = RedbDocumentLookup::open(&paths.documents()).unwrap();
     let dim = lookup.indexed_model_version().unwrap().unwrap().dimension;
     let store = RuVectorSearchAdapter::open(&paths.vectors(), dim).unwrap();
-    let search = SearchService { embedder: &MockEmbedder::new(DIM), store: &store, lookup: &lookup };
+    let keyword = RedbKeywordSearch::open(&paths.keyword()).unwrap();
+    let search = SearchService {
+        embedder: &MockEmbedder::new(DIM),
+        store: &store,
+        keyword: &keyword,
+        lookup: &lookup,
+    };
     let adapter = RetrievalSearchAdapter { inner: search };
     let evaluator = EvaluationService { search: &adapter };
 
     // Both files are ingested and only 2 chunks exist, so top-5 returns both → every question hits.
-    let questions = vec![question("q1", "docs/arch.md"), question("q2", "docs/deploy.md")];
+    let questions = vec![
+        question("q1", "docs/arch.md"),
+        question("q2", "docs/deploy.md"),
+    ];
     let run = evaluator.run(&questions, &config(Some(0.8)), "ds.json", "ev_it", NOW);
 
-    assert_eq!(run.status, EvalRunStatus::Completed, "Hit@3 should clear 0.8");
+    assert_eq!(
+        run.status,
+        EvalRunStatus::Completed,
+        "Hit@3 should clear 0.8"
+    );
     assert_eq!(run.metrics.question_count, 2);
     assert_eq!(run.metrics.hit_at_3, 1.0);
     assert_eq!(run.metrics.hit_at_5, 1.0);
@@ -124,7 +180,8 @@ fn end_to_end_eval_computes_metrics_and_writes_report() {
     // AC-5: report written and re-readable with the right shape.
     let out = paths.base.join("report.json").to_string_lossy().to_string();
     write_report(&out, &run).unwrap();
-    let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
     assert_eq!(report["metrics"]["questionCount"], 2);
     assert_eq!(report["searchMode"], "vector");
     assert_eq!(report["questionResults"].as_array().unwrap().len(), 2);
@@ -143,7 +200,13 @@ fn threshold_failure_when_expected_file_absent() {
     let lookup = RedbDocumentLookup::open(&paths.documents()).unwrap();
     let dim = lookup.indexed_model_version().unwrap().unwrap().dimension;
     let store = RuVectorSearchAdapter::open(&paths.vectors(), dim).unwrap();
-    let search = SearchService { embedder: &MockEmbedder::new(DIM), store: &store, lookup: &lookup };
+    let keyword = RedbKeywordSearch::open(&paths.keyword()).unwrap();
+    let search = SearchService {
+        embedder: &MockEmbedder::new(DIM),
+        store: &store,
+        keyword: &keyword,
+        lookup: &lookup,
+    };
     let adapter = RetrievalSearchAdapter { inner: search };
     let evaluator = EvaluationService { search: &adapter };
 
@@ -153,4 +216,49 @@ fn threshold_failure_when_expected_file_absent() {
     assert_eq!(run.status, EvalRunStatus::ThresholdFailed);
     assert_eq!(run.metrics.hit_at_3, 0.0);
     assert!(run.error.is_none(), "threshold miss is not a fatal error");
+}
+
+#[test]
+fn end_to_end_eval_runs_keyword_mode() {
+    let paths = Paths::new();
+    let dir = paths.base.join("docs");
+    {
+        write(&dir, "arch.md", "# Architecture\n\nlayering rules\n");
+        write(
+            &dir,
+            "deploy.md",
+            "# Deploy\n\nAzure Function zipDeploy 403 during release\n",
+        );
+        ingest_with_keyword(&paths, &dir);
+    }
+    let lookup = RedbDocumentLookup::open(&paths.documents()).unwrap();
+    let dim = lookup.indexed_model_version().unwrap().unwrap().dimension;
+    let store = RuVectorSearchAdapter::open(&paths.vectors(), dim).unwrap();
+    let keyword = RedbKeywordSearch::open(&paths.keyword()).unwrap();
+    let search = SearchService {
+        embedder: &MockEmbedder::new(DIM),
+        store: &store,
+        keyword: &keyword,
+        lookup: &lookup,
+    };
+    let adapter = RetrievalSearchAdapter { inner: search };
+    let evaluator = EvaluationService { search: &adapter };
+
+    let questions = vec![EvalQuestion {
+        id: "q_keyword".into(),
+        question: "zipDeploy 403".into(),
+        expected_chunk_ids: vec![],
+        expected_source_files: vec!["deploy.md".into()],
+    }];
+    let run = evaluator.run(
+        &questions,
+        &config_with_mode(SearchMode::Keyword, Some(0.8)),
+        "ds.json",
+        "ev_kw",
+        NOW,
+    );
+
+    assert_eq!(run.status, EvalRunStatus::Completed);
+    assert_eq!(run.search_mode, SearchMode::Keyword);
+    assert_eq!(run.metrics.hit_at_3, 1.0);
 }

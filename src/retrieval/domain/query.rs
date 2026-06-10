@@ -1,18 +1,38 @@
 //! Query value object + search mode + metadata filter (PRD §11.4, FR-SRCH-002).
 
 use crate::ingestion::domain::EmbeddingModelVersion;
+use serde::{Deserialize, Serialize};
 
-/// Search strategy. M2 implements `Vector`; `Keyword`/`Hybrid` arrive in M5
-/// (the seam exists so they plug in without touching the domain).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Search strategy (FR-SRCH-003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     Vector,
+    Keyword,
+    Hybrid,
 }
 
 impl std::fmt::Display for SearchMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SearchMode::Vector => write!(f, "vector"),
+            SearchMode::Keyword => write!(f, "keyword"),
+            SearchMode::Hybrid => write!(f, "hybrid"),
+        }
+    }
+}
+
+impl std::str::FromStr for SearchMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "vector" => Ok(SearchMode::Vector),
+            "keyword" => Ok(SearchMode::Keyword),
+            "hybrid" => Ok(SearchMode::Hybrid),
+            other => Err(format!(
+                "invalid search mode '{other}'; expected vector, keyword, or hybrid"
+            )),
         }
     }
 }
@@ -41,4 +61,29 @@ pub struct Query {
     pub top_k: usize,
     /// The model the query will be embedded with; checked against the index (R6).
     pub embedding_model: EmbeddingModelVersion,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn search_mode_parses_all_m5_modes() {
+        assert_eq!(SearchMode::from_str("vector").unwrap(), SearchMode::Vector);
+        assert_eq!(
+            SearchMode::from_str("keyword").unwrap(),
+            SearchMode::Keyword
+        );
+        assert_eq!(SearchMode::from_str("hybrid").unwrap(), SearchMode::Hybrid);
+        assert_eq!(SearchMode::Keyword.to_string(), "keyword");
+        assert_eq!(SearchMode::Hybrid.to_string(), "hybrid");
+    }
+
+    #[test]
+    fn search_mode_rejects_invalid_value_with_accepted_values() {
+        let err = SearchMode::from_str("semantic").unwrap_err();
+        assert!(err.contains("semantic"));
+        assert!(err.contains("vector, keyword, or hybrid"));
+    }
 }

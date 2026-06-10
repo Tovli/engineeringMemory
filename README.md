@@ -19,8 +19,10 @@ lightweight development and CI.
 - Embedded vector storage with `ruvector-core` and `redb`.
 - Local ONNX/MiniLM embeddings by default.
 - Deterministic mock embeddings for repeatable local development and CI.
-- Vector search with `--top-k`, `--project`, `--tag`, `--source`, and
-  `--explain`.
+- Vector, keyword, and hybrid search with `--top-k`, `--project`, `--tag`,
+  `--source`, and `--explain`.
+- Local full-chunk keyword index with application-level RRF fusion for hybrid
+  ranking.
 - Retrieval evaluation with Hit@1, Hit@3, Hit@5, MRR, latency, and an optional
   CI threshold gate.
 - RAG-style `ask` command with cited answers, citation validation, a no-answer
@@ -36,9 +38,9 @@ local workflow is working:
 - `tovli eval`
 - `tovli ask`
 
-Planned work includes hybrid search, feedback collection, a real LLM provider
-adapter, full-content answer context, an HTTP API, bot integrations, PDF
-support, and additional source connectors.
+Planned work includes feedback collection, a real LLM provider adapter,
+full-content answer context, an HTTP API, bot integrations, PDF support, and
+additional source connectors.
 
 ## Project Docs
 
@@ -111,13 +113,13 @@ that directory to reset the local index and answer log.
 ```text
 tovli spike
 tovli ingest <folder> [--dry-run] [--force] [--project <name>] [--tag <tag>] [--mock]
-tovli search <query> [--top-k <n>] [--mode vector] [--project <name>] [--tag <tag>] [--source <path>] [--explain] [--mock]
-tovli eval <questions.json> [--top-k <n>] [--mode vector] [--fail-below-hit-at-3 <fraction>] [--output <path>] [--mock]
-tovli ask <query> [--top-k <n>] [--mode vector] [--show-context] [--no-llm] [--mock]
+tovli search <query> [--top-k <n>] [--mode vector|keyword|hybrid] [--project <name>] [--tag <tag>] [--source <path>] [--explain] [--mock]
+tovli eval <questions.json> [--top-k <n>] [--mode vector|keyword|hybrid] [--fail-below-hit-at-3 <fraction>] [--output <path>] [--mock]
+tovli ask <query> [--top-k <n>] [--mode vector|keyword|hybrid] [--show-context] [--no-llm] [--mock]
 ```
 
-Only `--mode vector` is currently implemented. Keyword and hybrid modes are
-planned.
+Default mode is `vector`. `keyword` uses the local full-chunk keyword index.
+`hybrid` fuses vector and keyword ranks with Reciprocal Rank Fusion.
 
 ## Embedding Providers
 
@@ -166,7 +168,7 @@ The codebase is organized around bounded contexts and hexagonal seams:
 ```text
 src/
   ingestion/           parse, chunk, embed, and store documents
-  retrieval/           query embedding, vector search, filtering, ranking
+  retrieval/           vector/keyword/hybrid search, filtering, ranking
   evaluation/          retrieval quality datasets, metrics, and reports
   answer_generation/   context assembly, prompt rendering, citations, answers
   vector_store.rs      small RuVector spike/store abstraction

@@ -21,7 +21,7 @@ This roadmap describes likely project direction, not a commitment to dates.
 
 ## Future Work
 
-- Keyword and hybrid retrieval.
+- Feedback capture and retrieval debugging.
 - Feedback collection for retrieved chunks and generated answers.
 - HTTP API.
 - Bot integrations.

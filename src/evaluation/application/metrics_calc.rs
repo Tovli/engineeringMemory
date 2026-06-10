@@ -4,7 +4,7 @@
 use crate::evaluation::domain::metrics::EvalMetrics;
 use crate::evaluation::domain::question_result::EvalQuestionResult;
 use crate::evaluation::domain::run::{EvalRunStatus, ThresholdConfig};
-use crate::retrieval::application::scoring::SIMILARITY_THRESHOLD;
+use crate::retrieval::application::scoring::score_clears_similarity_threshold;
 
 /// Compute aggregate metrics from per-question results.
 pub fn compute_metrics(results: &[EvalQuestionResult]) -> EvalMetrics {
@@ -20,7 +20,7 @@ pub fn compute_metrics(results: &[EvalQuestionResult]) -> EvalMetrics {
         .iter()
         .filter(|r| match r.top_score {
             None => true,
-            Some(s) => s < SIMILARITY_THRESHOLD,
+            Some(s) => !score_clears_similarity_threshold(r.search_mode, s),
         })
         .count();
 
@@ -49,13 +49,24 @@ pub fn threshold_status(metrics: &EvalMetrics, threshold: &ThresholdConfig) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retrieval::domain::SearchMode;
 
     fn r(hit_rank: Option<usize>, latency: u128, top: Option<f32>) -> EvalQuestionResult {
+        r_with_mode(SearchMode::Vector, hit_rank, latency, top)
+    }
+
+    fn r_with_mode(
+        mode: SearchMode,
+        hit_rank: Option<usize>,
+        latency: u128,
+        top: Option<f32>,
+    ) -> EvalQuestionResult {
         let rr = hit_rank.map(|k| 1.0 / k as f64).unwrap_or(0.0);
         EvalQuestionResult {
             question_id: "q".into(),
             question_text: "?".into(),
             retrieval_run_id: "r".into(),
+            search_mode: mode,
             returned_chunk_ids: vec![],
             returned_source_paths: vec![],
             hit_at_1: hit_rank.is_some_and(|k| k <= 1),
@@ -104,13 +115,33 @@ mod tests {
     }
 
     #[test]
+    fn keyword_and_hybrid_scores_do_not_count_below_vector_threshold() {
+        let results = vec![
+            r_with_mode(SearchMode::Keyword, Some(1), 5, Some(0.01)),
+            r_with_mode(SearchMode::Hybrid, Some(1), 5, Some(0.01)),
+            r_with_mode(SearchMode::Keyword, None, 5, None),
+        ];
+        let m = compute_metrics(&results);
+        assert_eq!(m.empty_result_count, 1);
+        assert_eq!(m.below_threshold_count, 1);
+    }
+
+    #[test]
     fn threshold_gate_strict_below_fails_equal_passes() {
-        let mut m = EvalMetrics { hit_at_3: 0.80, ..Default::default() };
-        let t = ThresholdConfig { min_hit_at_3: Some(0.80) };
+        let mut m = EvalMetrics {
+            hit_at_3: 0.80,
+            ..Default::default()
+        };
+        let t = ThresholdConfig {
+            min_hit_at_3: Some(0.80),
+        };
         assert_eq!(threshold_status(&m, &t), EvalRunStatus::Completed); // equal passes (E8)
         m.hit_at_3 = 0.79;
         assert_eq!(threshold_status(&m, &t), EvalRunStatus::ThresholdFailed);
         // no threshold configured → always completed
-        assert_eq!(threshold_status(&m, &ThresholdConfig::default()), EvalRunStatus::Completed);
+        assert_eq!(
+            threshold_status(&m, &ThresholdConfig::default()),
+            EvalRunStatus::Completed
+        );
     }
 }

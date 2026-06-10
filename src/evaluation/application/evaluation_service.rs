@@ -79,13 +79,22 @@ impl EvaluationService<'_> {
 }
 
 /// Score one question against its RetrievalRun (uses first relevant rank only — E7).
-fn judge(q: &EvalQuestion, rrun: &crate::retrieval::domain::RetrievalRun, run_id: &str) -> EvalQuestionResult {
-    let first_rank = rrun.results.iter().find(|r| is_relevant(q, r)).map(|r| r.rank);
+fn judge(
+    q: &EvalQuestion,
+    rrun: &crate::retrieval::domain::RetrievalRun,
+    run_id: &str,
+) -> EvalQuestionResult {
+    let first_rank = rrun
+        .results
+        .iter()
+        .find(|r| is_relevant(q, r))
+        .map(|r| r.rank);
     let reciprocal_rank = first_rank.map(|k| 1.0 / k as f64).unwrap_or(0.0);
     EvalQuestionResult {
         question_id: q.id.clone(),
         question_text: q.question.clone(),
         retrieval_run_id: run_id.to_string(),
+        search_mode: rrun.search_mode,
         returned_chunk_ids: rrun.results.iter().map(|r| r.chunk_id.clone()).collect(),
         returned_source_paths: rrun.results.iter().map(|r| r.source_path.clone()).collect(),
         hit_at_1: first_rank.is_some_and(|k| k <= 1),
@@ -108,13 +117,22 @@ mod tests {
     use crate::retrieval::domain::{RetrievalResult, RetrievalRun, RunReason, SearchMode};
 
     fn model() -> EmbeddingModelVersion {
-        EmbeddingModelVersion { name: "mock".into(), dimension: 8, created_at: "t".into() }
+        EmbeddingModelVersion {
+            name: "mock".into(),
+            dimension: 8,
+            created_at: "t".into(),
+        }
     }
     fn config(threshold: Option<f64>) -> EvalRunConfig {
+        config_with_mode(SearchMode::Vector, threshold)
+    }
+    fn config_with_mode(mode: SearchMode, threshold: Option<f64>) -> EvalRunConfig {
         EvalRunConfig {
-            mode: SearchMode::Vector,
+            mode,
             top_k: 3,
-            threshold: crate::evaluation::domain::run::ThresholdConfig { min_hit_at_3: threshold },
+            threshold: crate::evaluation::domain::run::ThresholdConfig {
+                min_hit_at_3: threshold,
+            },
             embedding_model: model(),
         }
     }
@@ -139,17 +157,20 @@ mod tests {
         }
     }
     fn run_with(results: Vec<RetrievalResult>) -> RetrievalRun {
+        run_with_mode(SearchMode::Vector, results)
+    }
+    fn run_with_mode(mode: SearchMode, results: Vec<RetrievalResult>) -> RetrievalRun {
         RetrievalRun {
             id: "rr".into(),
             query: Query {
                 text: "x".into(),
-                mode: SearchMode::Vector,
+                mode,
                 filters: MetadataFilter::default(),
                 top_k: 5,
                 embedding_model: model(),
             },
             results,
-            search_mode: SearchMode::Vector,
+            search_mode: mode,
             top_k: 5,
             latency_ms: 12,
             below_threshold_count: 0,
@@ -165,7 +186,9 @@ mod tests {
     }
     impl FakePort {
         fn new(runs: Vec<anyhow::Result<RetrievalRun>>) -> Self {
-            Self { runs: RefCell::new(runs.into_iter().collect()) }
+            Self {
+                runs: RefCell::new(runs.into_iter().collect()),
+            }
         }
     }
     impl SearchPort for FakePort {
@@ -176,11 +199,20 @@ mod tests {
 
     #[test]
     fn computes_metrics_over_dataset() {
-        let questions = vec![question("q1", &["docs/a.md"]), question("q2", &["docs/b.md"])];
+        let questions = vec![
+            question("q1", &["docs/a.md"]),
+            question("q2", &["docs/b.md"]),
+        ];
         // q1: relevant at rank 1; q2: relevant at rank 2
         let port = FakePort::new(vec![
-            Ok(run_with(vec![res(1, "docs/a.md", 0.9), res(2, "docs/x.md", 0.5)])),
-            Ok(run_with(vec![res(1, "docs/y.md", 0.7), res(2, "docs/b.md", 0.6)])),
+            Ok(run_with(vec![
+                res(1, "docs/a.md", 0.9),
+                res(2, "docs/x.md", 0.5),
+            ])),
+            Ok(run_with(vec![
+                res(1, "docs/y.md", 0.7),
+                res(2, "docs/b.md", 0.6),
+            ])),
         ]);
         let svc = EvaluationService { search: &port };
         let run = svc.run(&questions, &config(None), "ds.json", "ev1", "t");
@@ -189,7 +221,7 @@ mod tests {
         assert_eq!(run.metrics.question_count, 2);
         assert!((run.metrics.hit_at_1 - 0.5).abs() < 1e-9); // only q1 at rank 1
         assert!((run.metrics.hit_at_3 - 1.0).abs() < 1e-9); // both within 3
-        // MRR = (1/1 + 1/2)/2 = 0.75
+                                                            // MRR = (1/1 + 1/2)/2 = 0.75
         assert!((run.metrics.mrr - 0.75).abs() < 1e-9);
         assert_eq!(run.question_results[1].retrieval_run_id, "ev1_q1");
     }
@@ -208,7 +240,10 @@ mod tests {
 
     #[test]
     fn fatal_search_error_aborts_with_failed_status() {
-        let questions = vec![question("q1", &["docs/a.md"]), question("q2", &["docs/b.md"])];
+        let questions = vec![
+            question("q1", &["docs/a.md"]),
+            question("q2", &["docs/b.md"]),
+        ];
         let port = FakePort::new(vec![Err(anyhow::anyhow!("embedding model mismatch: ..."))]);
         let svc = EvaluationService { search: &port };
         let run = svc.run(&questions, &config(None), "ds.json", "ev", "t");
@@ -225,5 +260,24 @@ mod tests {
         assert_eq!(run.metrics.empty_result_count, 1);
         assert_eq!(run.metrics.hit_at_1, 0.0);
         assert_eq!(run.metrics.mrr, 0.0);
+    }
+
+    #[test]
+    fn keyword_eval_does_not_apply_vector_similarity_threshold() {
+        let questions = vec![question("q1", &["docs/a.md"])];
+        let port = FakePort::new(vec![Ok(run_with_mode(
+            SearchMode::Keyword,
+            vec![res(1, "docs/a.md", 0.10)],
+        ))]);
+        let svc = EvaluationService { search: &port };
+        let run = svc.run(
+            &questions,
+            &config_with_mode(SearchMode::Keyword, None),
+            "ds.json",
+            "ev",
+            "t",
+        );
+        assert_eq!(run.metrics.empty_result_count, 0);
+        assert_eq!(run.metrics.below_threshold_count, 0);
     }
 }

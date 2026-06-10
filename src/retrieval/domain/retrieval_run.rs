@@ -22,7 +22,8 @@ pub struct RetrievalRun {
     pub search_mode: SearchMode,
     pub top_k: usize,
     pub latency_ms: u128,
-    /// Results with score < SIMILARITY_THRESHOLD (E10; feeds M3/M4).
+    /// Vector-mode results with score < SIMILARITY_THRESHOLD. Keyword/hybrid scores are
+    /// mode-relative and are not counted against the vector similarity threshold.
     pub below_threshold_count: usize,
     pub reason: RunReason,
     pub explain: Option<ExplainPayload>,

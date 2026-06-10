@@ -3,6 +3,7 @@ name: Publish crates
 'on':
   push:
     branches:
+      - main
       - master
   workflow_dispatch:
 
@@ -24,6 +25,46 @@ jobs:
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: rustup show
+
+      - name: Auto-bump crate versions
+        shell: pwsh
+        run: |
+          $runNumber = [int64] $env:GITHUB_RUN_NUMBER
+          if ($runNumber -le 0) {
+            throw "GITHUB_RUN_NUMBER must be a positive integer"
+          }
+
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+
+          foreach ($package in $metadata.packages) {
+            if ($package.publish -eq $false) {
+              Write-Host "Skipping $($package.name) because publish=false"
+              continue
+            }
+
+            $name = $package.name
+            $manifestPath = $package.manifest_path
+            $currentVersion = [string] $package.version
+
+            if ($currentVersion -notmatch '^(?<major>0|[1-9][0-9]*)\.(?<minor>0|[1-9][0-9]*)\.(?<patch>0|[1-9][0-9]*)$') {
+              throw "Cannot auto-bump $name version '$currentVersion'; expected major.minor.patch"
+            }
+
+            $newVersion = "$($Matches.major).$($Matches.minor).$runNumber"
+            $manifest = Get-Content -Raw -Path $manifestPath
+            $versionPattern = '(?m)^(\s*version\s*=\s*)"' + [regex]::Escape($currentVersion) + '"'
+            $versionRegex = [regex] $versionPattern
+            $updated = $versionRegex.Replace($manifest, '${1}"' + $newVersion + '"', 1)
+
+            if ($updated -eq $manifest) {
+              throw "Failed to update version for $name in $manifestPath"
+            }
+
+            Set-Content -Path $manifestPath -Value $updated -NoNewline
+            Write-Host "Set $name version from $currentVersion to $newVersion"
+          }
+
+          cargo update --workspace
 
       - name: Discover unpublished versions
         id: discover

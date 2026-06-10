@@ -14,7 +14,8 @@ pub struct EvalMetrics {
     pub avg_latency_ms: f64,
     /// Questions that returned zero results.
     pub empty_result_count: usize,
-    /// Questions whose top result is below SIMILARITY_THRESHOLD (or returned nothing).
+    /// Questions with no result, plus vector-mode questions whose top result is below
+    /// SIMILARITY_THRESHOLD.
     pub below_threshold_count: usize,
     pub question_count: usize,
 }

@@ -84,5 +84,12 @@ candidate depth, or weights before making hybrid the recommended mode.
 - **-** RRF is rank-based, so it discards raw score magnitude. The explain payload keeps per-mode scores
   visible to make tuning possible.
 - **-** Candidate depth and weights are heuristics until eval data proves better values.
+- **-** The ADR-0003 weak-retrieval floor is calibrated for vector cosine similarity only. Keyword and
+  hybrid scores are mode-relative in M5, so `ask --mode keyword|hybrid` should be reviewed against eval
+  data before adding a no-answer floor for those modes.
+- **-** The default redb keyword adapter is intentionally lightweight for M5: it stores full chunk content
+  plus preview, then scans/deserializes/tokenizes the keyword table per query to compute BM25. This is
+  acceptable at milestone scale but should be replaced with a persisted inverted index or cached document
+  frequencies when corpus size makes eval latency unacceptable.
 - **Future (M9):** RuVector-native sparse or hybrid search can replace the default lexical adapter only
   if it improves quality or latency against the same vector/keyword/hybrid evaluation reports.

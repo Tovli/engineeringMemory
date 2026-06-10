@@ -13,7 +13,7 @@ use crate::ingestion::domain::{
 };
 use crate::ingestion::embedding::EmbeddingService;
 use crate::ingestion::ports::{
-    ChunkWithEmbedding, DocumentRepository, Embedder, FileParser, VectorStorePort,
+    ChunkWithEmbedding, DocumentRepository, Embedder, FileParser, KeywordIndexPort, VectorStorePort,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -28,6 +28,7 @@ pub struct IngestionOrchestrator<'a> {
     pub parsers: &'a [Box<dyn FileParser>],
     pub embedder: &'a dyn Embedder,
     pub store: &'a dyn VectorStorePort,
+    pub keyword_index: Option<&'a dyn KeywordIndexPort>,
     pub docs: &'a dyn DocumentRepository,
     pub chunking: ChunkingService,
 }
@@ -47,13 +48,20 @@ impl<'a> IngestionOrchestrator<'a> {
         opts: &IngestOptions,
         now: &str,
     ) -> anyhow::Result<IngestionSummary> {
-        let mut summary = IngestionSummary { dry_run: opts.dry_run, ..Default::default() };
+        let mut summary = IngestionSummary {
+            dry_run: opts.dry_run,
+            ..Default::default()
+        };
         let embed = EmbeddingService::new(self.embedder);
         let model = embed.model_version().clone();
         let root_str = root.to_string_lossy().to_string();
         let mut seen: HashSet<DocumentId> = HashSet::new();
 
-        for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(Result::ok) {
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -68,7 +76,9 @@ impl<'a> IngestionOrchestrator<'a> {
 
             let Some(parser) = self.parser_for(&ext) else {
                 summary.files_skipped += 1;
-                summary.skipped.push((path_str, format!("unsupported extension '.{ext}'")));
+                summary
+                    .skipped
+                    .push((path_str, format!("unsupported extension '.{ext}'")));
                 continue;
             };
 
@@ -107,9 +117,12 @@ impl<'a> IngestionOrchestrator<'a> {
             for c in &mut chunks {
                 let char_len = c.content.chars().count();
                 c.metadata.insert("source_path".into(), path_str.clone());
-                c.metadata.insert("char_length".into(), char_len.to_string());
-                c.metadata.insert("embedding_model".into(), model.name.clone());
-                c.metadata.insert("embedding_dimension".into(), model.dimension.to_string());
+                c.metadata
+                    .insert("char_length".into(), char_len.to_string());
+                c.metadata
+                    .insert("embedding_model".into(), model.name.clone());
+                c.metadata
+                    .insert("embedding_dimension".into(), model.dimension.to_string());
                 if let Some(t) = &parsed.title {
                     c.metadata.insert("title".into(), t.clone());
                 }
@@ -148,6 +161,12 @@ impl<'a> IngestionOrchestrator<'a> {
                 // edge case E1
                 summary.files_empty += 1;
                 if !opts.dry_run {
+                    if existing.is_some() {
+                        self.store.delete_by_document(&did)?;
+                        if let Some(keyword_index) = self.keyword_index {
+                            keyword_index.delete_by_document(&did)?;
+                        }
+                    }
                     self.docs.save(&doc)?;
                 }
                 seen.insert(did);
@@ -167,13 +186,23 @@ impl<'a> IngestionOrchestrator<'a> {
             // Modified file → drop old chunks before re-indexing (AC-4).
             if existing.is_some() {
                 self.store.delete_by_document(&did)?;
+                if let Some(keyword_index) = self.keyword_index {
+                    keyword_index.delete_by_document(&did)?;
+                }
             }
             let items: Vec<ChunkWithEmbedding> = chunks
                 .iter()
                 .zip(vectors)
-                .map(|(c, v)| ChunkWithEmbedding { chunk: c, vector: v })
+                .map(|(c, v)| ChunkWithEmbedding {
+                    chunk: c,
+                    vector: v,
+                })
                 .collect();
             self.store.upsert_chunks(&items)?; // AC-8 dim guard lives in the adapter
+            if let Some(keyword_index) = self.keyword_index {
+                let chunk_refs: Vec<_> = chunks.iter().collect();
+                keyword_index.upsert_chunks(&chunk_refs)?;
+            }
 
             doc.status = DocumentStatus::Active;
             self.docs.save(&doc)?;
@@ -188,6 +217,9 @@ impl<'a> IngestionOrchestrator<'a> {
                 if !seen.contains(&doc.id) {
                     self.docs.soft_delete(&doc.id)?;
                     self.store.delete_by_document(&doc.id)?;
+                    if let Some(keyword_index) = self.keyword_index {
+                        keyword_index.delete_by_document(&doc.id)?;
+                    }
                     summary.files_deleted += 1;
                 }
             }
@@ -203,6 +235,7 @@ mod tests {
     use crate::ingestion::domain::ChunkingConfig;
     use crate::ingestion::infra::mock_embedder::MockEmbedder;
     use crate::ingestion::infra::parsers::default_parsers;
+    use crate::ingestion::ports::KeywordIndexPort;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -218,7 +251,9 @@ mod tests {
             Ok(self.by_path.borrow().get(path).cloned())
         }
         fn save(&self, doc: &IngestionDocument) -> anyhow::Result<()> {
-            self.by_path.borrow_mut().insert(doc.source_path.clone(), doc.clone());
+            self.by_path
+                .borrow_mut()
+                .insert(doc.source_path.clone(), doc.clone());
             Ok(())
         }
         fn soft_delete(&self, id: &DocumentId) -> anyhow::Result<()> {
@@ -246,7 +281,10 @@ mod tests {
     }
     impl MemStore {
         fn new(dim: usize) -> Self {
-            Self { dim, by_doc: RefCell::new(HashMap::new()) }
+            Self {
+                dim,
+                by_doc: RefCell::new(HashMap::new()),
+            }
         }
         fn chunk_count(&self) -> usize {
             self.by_doc.borrow().values().map(|v| v.len()).sum()
@@ -256,7 +294,11 @@ mod tests {
         fn upsert_chunks(&self, items: &[ChunkWithEmbedding]) -> anyhow::Result<()> {
             for it in items {
                 if it.vector.len() != self.dim {
-                    anyhow::bail!("dim mismatch: vector {} != index {}", it.vector.len(), self.dim);
+                    anyhow::bail!(
+                        "dim mismatch: vector {} != index {}",
+                        it.vector.len(),
+                        self.dim
+                    );
                 }
                 self.by_doc
                     .borrow_mut()
@@ -268,6 +310,35 @@ mod tests {
         }
         fn delete_by_document(&self, id: &DocumentId) -> anyhow::Result<()> {
             self.by_doc.borrow_mut().remove(id);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MemKeywordIndex {
+        by_doc: RefCell<HashMap<DocumentId, Vec<String>>>,
+        contents: RefCell<HashMap<String, String>>,
+    }
+    impl KeywordIndexPort for MemKeywordIndex {
+        fn upsert_chunks(&self, chunks: &[&crate::ingestion::domain::Chunk]) -> anyhow::Result<()> {
+            for chunk in chunks {
+                self.by_doc
+                    .borrow_mut()
+                    .entry(chunk.document_id.clone())
+                    .or_default()
+                    .push(chunk.id.clone());
+                self.contents
+                    .borrow_mut()
+                    .insert(chunk.id.clone(), chunk.content.clone());
+            }
+            Ok(())
+        }
+
+        fn delete_by_document(&self, id: &DocumentId) -> anyhow::Result<()> {
+            let removed = self.by_doc.borrow_mut().remove(id).unwrap_or_default();
+            for chunk_id in removed {
+                self.contents.borrow_mut().remove(&chunk_id);
+            }
             Ok(())
         }
     }
@@ -296,6 +367,7 @@ mod tests {
             parsers,
             embedder,
             store,
+            keyword_index: None,
             docs,
             chunking: ChunkingService::new(ChunkingConfig::default()),
         }
@@ -307,7 +379,12 @@ mod tests {
         let dir = tmpdir();
         write(&dir, "a.md", "# Arch\n\nlayering rules and boundaries\n");
         write(&dir, "b.txt", "plain text content here");
-        let (parsers, emb, store, docs) = (default_parsers(), MockEmbedder::new(DIM), MemStore::new(DIM), MemRepo::default());
+        let (parsers, emb, store, docs) = (
+            default_parsers(),
+            MockEmbedder::new(DIM),
+            MemStore::new(DIM),
+            MemRepo::default(),
+        );
         let o = orchestrator(&parsers, &emb, &store, &docs);
 
         let s = o.ingest(&dir, &IngestOptions::default(), NOW).unwrap();
@@ -316,7 +393,10 @@ mod tests {
         assert!(s.chunks_created >= 2);
         assert_eq!(store.chunk_count(), s.chunks_created);
         // AC-6: metadata persisted on the document record
-        let saved = docs.find_by_path(&dir.join("a.md").to_string_lossy()).unwrap().unwrap();
+        let saved = docs
+            .find_by_path(&dir.join("a.md").to_string_lossy())
+            .unwrap()
+            .unwrap();
         assert_eq!(saved.embedding_dimension, DIM);
         assert_eq!(saved.embedding_model, "mock-deterministic");
         assert_eq!(saved.title.as_deref(), Some("Arch"));
@@ -328,11 +408,21 @@ mod tests {
         let dir = tmpdir();
         write(&dir, "keep.md", "# K\n\nbody");
         write(&dir, "image.png", "not really an image");
-        let (parsers, emb, store, docs) = (default_parsers(), MockEmbedder::new(DIM), MemStore::new(DIM), MemRepo::default());
-        let s = orchestrator(&parsers, &emb, &store, &docs).ingest(&dir, &IngestOptions::default(), NOW).unwrap();
+        let (parsers, emb, store, docs) = (
+            default_parsers(),
+            MockEmbedder::new(DIM),
+            MemStore::new(DIM),
+            MemRepo::default(),
+        );
+        let s = orchestrator(&parsers, &emb, &store, &docs)
+            .ingest(&dir, &IngestOptions::default(), NOW)
+            .unwrap();
         assert_eq!(s.files_ingested, 1);
         assert_eq!(s.files_skipped, 1);
-        assert!(s.skipped.iter().any(|(p, r)| p.ends_with("image.png") && r.contains("unsupported")));
+        assert!(s
+            .skipped
+            .iter()
+            .any(|(p, r)| p.ends_with("image.png") && r.contains("unsupported")));
     }
 
     #[test]
@@ -340,7 +430,12 @@ mod tests {
         // AC-3
         let dir = tmpdir();
         write(&dir, "a.md", "# A\n\ncontent one two three");
-        let (parsers, emb, store, docs) = (default_parsers(), MockEmbedder::new(DIM), MemStore::new(DIM), MemRepo::default());
+        let (parsers, emb, store, docs) = (
+            default_parsers(),
+            MockEmbedder::new(DIM),
+            MemStore::new(DIM),
+            MemRepo::default(),
+        );
         let o = orchestrator(&parsers, &emb, &store, &docs);
         let first = o.ingest(&dir, &IngestOptions::default(), NOW).unwrap();
         assert_eq!(first.files_ingested, 1);
@@ -356,7 +451,12 @@ mod tests {
         let dir = tmpdir();
         write(&dir, "a.md", "# A\n\noriginal content");
         write(&dir, "b.md", "# B\n\nstable content");
-        let (parsers, emb, store, docs) = (default_parsers(), MockEmbedder::new(DIM), MemStore::new(DIM), MemRepo::default());
+        let (parsers, emb, store, docs) = (
+            default_parsers(),
+            MockEmbedder::new(DIM),
+            MemStore::new(DIM),
+            MemRepo::default(),
+        );
         let o = orchestrator(&parsers, &emb, &store, &docs);
         o.ingest(&dir, &IngestOptions::default(), NOW).unwrap();
         write(&dir, "a.md", "# A\n\nCHANGED content entirely now");
@@ -366,18 +466,78 @@ mod tests {
     }
 
     #[test]
+    fn syncs_keyword_index_on_insert_modify_and_delete() {
+        let dir = tmpdir();
+        write(&dir, "a.md", "# A\n\nfirst lexical content");
+        let (parsers, emb, store, docs, keyword) = (
+            default_parsers(),
+            MockEmbedder::new(DIM),
+            MemStore::new(DIM),
+            MemRepo::default(),
+            MemKeywordIndex::default(),
+        );
+        let o = IngestionOrchestrator {
+            parsers: &parsers,
+            embedder: &emb,
+            store: &store,
+            keyword_index: Some(&keyword),
+            docs: &docs,
+            chunking: ChunkingService::new(ChunkingConfig::default()),
+        };
+
+        o.ingest(&dir, &IngestOptions::default(), NOW).unwrap();
+        assert!(keyword
+            .contents
+            .borrow()
+            .values()
+            .any(|c| c.contains("first lexical content")));
+
+        write(&dir, "a.md", "# A\n\nsecond lexical content");
+        o.ingest(&dir, &IngestOptions::default(), NOW).unwrap();
+        let indexed_contents: Vec<String> = keyword.contents.borrow().values().cloned().collect();
+        assert!(indexed_contents
+            .iter()
+            .any(|c| c.contains("second lexical content")));
+        assert!(!indexed_contents
+            .iter()
+            .any(|c| c.contains("first lexical content")));
+
+        std::fs::remove_file(dir.join("a.md")).unwrap();
+        o.ingest(&dir, &IngestOptions::default(), NOW).unwrap();
+        assert!(
+            keyword.contents.borrow().is_empty(),
+            "deleted documents should remove keyword chunks"
+        );
+    }
+
+    #[test]
     fn dry_run_writes_nothing() {
         // AC-7
         let dir = tmpdir();
         write(&dir, "a.md", "# A\n\nbody content here");
-        let (parsers, emb, store, docs) = (default_parsers(), MockEmbedder::new(DIM), MemStore::new(DIM), MemRepo::default());
-        let opts = IngestOptions { dry_run: true, ..Default::default() };
-        let s = orchestrator(&parsers, &emb, &store, &docs).ingest(&dir, &opts, NOW).unwrap();
+        let (parsers, emb, store, docs) = (
+            default_parsers(),
+            MockEmbedder::new(DIM),
+            MemStore::new(DIM),
+            MemRepo::default(),
+        );
+        let opts = IngestOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let s = orchestrator(&parsers, &emb, &store, &docs)
+            .ingest(&dir, &opts, NOW)
+            .unwrap();
         assert!(s.dry_run);
         assert_eq!(s.files_ingested, 1);
         assert!(s.chunks_created >= 1);
         assert_eq!(store.chunk_count(), 0, "no vectors written");
-        assert!(docs.find_by_path(&dir.join("a.md").to_string_lossy()).unwrap().is_none(), "no doc record written");
+        assert!(
+            docs.find_by_path(&dir.join("a.md").to_string_lossy())
+                .unwrap()
+                .is_none(),
+            "no doc record written"
+        );
     }
 
     #[test]
@@ -385,8 +545,17 @@ mod tests {
         // AC-8: embedder dim != index dim → error
         let dir = tmpdir();
         write(&dir, "a.md", "# A\n\nbody");
-        let (parsers, emb, store, docs) = (default_parsers(), MockEmbedder::new(4), MemStore::new(8), MemRepo::default());
-        let r = orchestrator(&parsers, &emb, &store, &docs).ingest(&dir, &IngestOptions::default(), NOW);
+        let (parsers, emb, store, docs) = (
+            default_parsers(),
+            MockEmbedder::new(4),
+            MemStore::new(8),
+            MemRepo::default(),
+        );
+        let r = orchestrator(&parsers, &emb, &store, &docs).ingest(
+            &dir,
+            &IngestOptions::default(),
+            NOW,
+        );
         assert!(r.is_err(), "dimension mismatch must error");
         assert!(format!("{:#}", r.unwrap_err()).contains("dim mismatch"));
     }

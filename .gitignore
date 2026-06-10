@@ -3,4 +3,5 @@
 /models
 /.tovli
 .swarm/
+.claude-flow/
 ruvector.db

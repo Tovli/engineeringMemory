@@ -37,6 +37,12 @@ pub trait VectorStorePort {
     fn delete_by_document(&self, id: &DocumentId) -> anyhow::Result<()>;
 }
 
+/// Persists full chunk text into the local keyword index (M5 / ADR-0009).
+pub trait KeywordIndexPort {
+    fn upsert_chunks(&self, chunks: &[&Chunk]) -> anyhow::Result<()>;
+    fn delete_by_document(&self, id: &DocumentId) -> anyhow::Result<()>;
+}
+
 /// Persists document records + enables idempotency/incremental detection (redb).
 pub trait DocumentRepository {
     fn find_by_path(&self, path: &str) -> anyhow::Result<Option<IngestionDocument>>;
