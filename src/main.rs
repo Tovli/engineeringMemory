@@ -13,6 +13,11 @@ use tovli::evaluation::domain::{EvalRun, EvalRunConfig, EvalRunStatus, Threshold
 use tovli::evaluation::infra::dataset_loader::load_dataset;
 use tovli::evaluation::infra::report_writer::write_report;
 use tovli::evaluation::infra::retrieval_search_adapter::RetrievalSearchAdapter;
+use tovli::feedback::application::{
+    next_query_run_ids, FeedbackReportService, FeedbackService, RecordFeedbackInput,
+};
+use tovli::feedback::domain::{FeedbackRating, FeedbackReport, RetrievalRunEvidence};
+use tovli::feedback::infra::{export_feedback_json, JsonlRetrievalRunLog, RedbFeedbackRepository};
 use tovli::ingestion::chunking::ChunkingService;
 use tovli::ingestion::domain::{ChunkingConfig, IngestionSummary};
 use tovli::ingestion::infra::mock_embedder::MockEmbedder;
@@ -53,6 +58,10 @@ enum Command {
     Eval(EvalArgs),
     /// Ask a question and get a cited answer generated from retrieved chunks (RAG).
     Ask(AskArgs),
+    /// Record useful/not-useful feedback for chunks returned by a prior search/ask run.
+    Feedback(FeedbackArgs),
+    /// Report problematic retrieval patterns from stored feedback.
+    FeedbackReport(FeedbackReportArgs),
 }
 
 #[derive(Args)]
@@ -145,8 +154,36 @@ struct AskArgs {
     mock: bool,
 }
 
+#[derive(Args)]
+struct FeedbackArgs {
+    /// Query id printed by `search` or `ask`.
+    #[arg(long = "query-id")]
+    query_id: String,
+    /// Retrieval run id printed by `search` or `ask`; defaults to the latest run for query-id.
+    #[arg(long = "run-id", alias = "retrieval-run-id")]
+    run_id: Option<String>,
+    /// Mark this displayed chunk as useful (repeatable).
+    #[arg(long = "good")]
+    good: Vec<String>,
+    /// Mark this displayed chunk as not useful (repeatable).
+    #[arg(long = "bad")]
+    bad: Vec<String>,
+    /// Optional note stored with every feedback item in this command.
+    #[arg(long)]
+    note: Option<String>,
+}
+
+#[derive(Args)]
+struct FeedbackReportArgs {
+    /// Export the raw append-only feedback log as JSON.
+    #[arg(long)]
+    export: Option<String>,
+}
+
 const STORE_DIR: &str = ".tovli";
 const KEYWORD_INDEX_FILE: &str = "keyword.redb";
+const RETRIEVAL_RUN_LOG_FILE: &str = "retrieval-runs.jsonl";
+const FEEDBACK_FILE: &str = "feedback.redb";
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
@@ -155,6 +192,8 @@ fn main() -> anyhow::Result<()> {
         Command::Search(args) => run_search(args),
         Command::Eval(args) => run_eval(args),
         Command::Ask(args) => run_ask(args),
+        Command::Feedback(args) => run_feedback(args),
+        Command::FeedbackReport(args) => run_feedback_report(args),
     }
 }
 
@@ -259,6 +298,7 @@ fn print_summary(s: &IngestionSummary, config: &ChunkingConfig) {
 // ---------------------------------------------------------------------------
 
 fn run_search(args: SearchArgs) -> anyhow::Result<()> {
+    std::fs::create_dir_all(STORE_DIR)?;
     let mode = parse_mode_or_exit(&args.mode);
 
     let embedder = build_embedder(args.mock)?;
@@ -295,9 +335,13 @@ fn run_search(args: SearchArgs) -> anyhow::Result<()> {
         keyword: &keyword,
         lookup: &lookup,
     };
-    let run_id = format!("rrun_{}", chrono::Utc::now().timestamp_millis());
+    let ids = next_query_run_ids(chrono::Utc::now().timestamp_millis());
+    let query_id = ids.query_id;
+    let run_id = ids.retrieval_run_id;
     let now = chrono::Utc::now().to_rfc3339();
     let run = svc.search(&query, args.explain, &run_id, &now)?; // mismatch (AC-7) surfaces here
+    append_run_evidence(&run, &query_id)?;
+    println!("query-id: {query_id}   run-id: {run_id}");
     print_results(&run);
     Ok(())
 }
@@ -468,6 +512,7 @@ fn print_eval(run: &EvalRun) {
 // ---------------------------------------------------------------------------
 
 fn run_ask(args: AskArgs) -> anyhow::Result<()> {
+    std::fs::create_dir_all(STORE_DIR)?;
     let mode = parse_mode_or_exit(&args.mode);
 
     let embedder = build_embedder(args.mock)?;
@@ -499,8 +544,13 @@ fn run_ask(args: AskArgs) -> anyhow::Result<()> {
         lookup: &lookup,
     };
     let ts = chrono::Utc::now().timestamp_millis();
+    let ids = next_query_run_ids(ts);
+    let query_id = ids.query_id;
+    let run_id = ids.retrieval_run_id;
     let now = chrono::Utc::now().to_rfc3339();
-    let run = svc.search(&query, false, &format!("rrun_{ts}"), &now)?; // model mismatch surfaces here
+    let run = svc.search(&query, false, &run_id, &now)?; // model mismatch surfaces here
+    append_run_evidence(&run, &query_id)?;
+    println!("query-id: {query_id}   run-id: {run_id}");
 
     if args.show_context || args.no_llm {
         print_context(&run);
@@ -512,7 +562,6 @@ fn run_ask(args: AskArgs) -> anyhow::Result<()> {
 
     let llm = MockLlm::default();
     let rag = RagAnswerService { llm: &llm };
-    let query_id = format!("qry_{ts}");
     let answer_id = format!("ans_{ts}");
     let actx = AnswerContext {
         query_id: &query_id,
@@ -530,6 +579,133 @@ fn run_ask(args: AskArgs) -> anyhow::Result<()> {
         std::process::exit(3);
     }
     Ok(())
+}
+
+fn run_feedback(args: FeedbackArgs) -> anyhow::Result<()> {
+    std::fs::create_dir_all(STORE_DIR)?;
+    if args.good.is_empty() && args.bad.is_empty() {
+        anyhow::bail!("provide at least one --good <chunk-id> or --bad <chunk-id>");
+    }
+
+    let runs = JsonlRetrievalRunLog::open(&format!("{STORE_DIR}/{RETRIEVAL_RUN_LOG_FILE}"));
+    let run_id = match args.run_id {
+        Some(id) => id,
+        None => runs
+            .find_latest_by_query_id(&args.query_id)?
+            .map(|run| run.retrieval_run_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("no retrieval run found for query id '{}'", args.query_id)
+            })?,
+    };
+    let repo = RedbFeedbackRepository::open(&format!("{STORE_DIR}/{FEEDBACK_FILE}"))?;
+    let service = FeedbackService {
+        feedback: &repo,
+        runs: &runs,
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let seed = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() * 1_000_000);
+    let inputs: Vec<RecordFeedbackInput> = args
+        .good
+        .iter()
+        .map(|id| (FeedbackRating::Good, id))
+        .chain(args.bad.iter().map(|id| (FeedbackRating::Bad, id)))
+        .enumerate()
+        .map(|(i, (rating, chunk_id))| RecordFeedbackInput {
+            feedback_id: format!("fb_{seed}_{i}"),
+            query_id: args.query_id.clone(),
+            retrieval_run_id: run_id.clone(),
+            chunk_id: chunk_id.clone(),
+            rating,
+            note: args.note.clone(),
+            created_at: now.clone(),
+        })
+        .collect();
+    let items = service.record_many(inputs)?;
+    for item in items {
+        println!(
+            "recorded feedback {}: {} {} (query-id: {}   run-id: {})",
+            item.id, item.rating, item.chunk_id, item.query_id, item.retrieval_run_id
+        );
+    }
+    Ok(())
+}
+
+fn run_feedback_report(args: FeedbackReportArgs) -> anyhow::Result<()> {
+    std::fs::create_dir_all(STORE_DIR)?;
+    let repo = RedbFeedbackRepository::open(&format!("{STORE_DIR}/{FEEDBACK_FILE}"))?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let report = FeedbackReportService { feedback: &repo }.generate(
+        &format!("rpt_{}", chrono::Utc::now().timestamp_millis()),
+        &now,
+    )?;
+    print_feedback_report(&report);
+    if let Some(path) = args.export {
+        export_feedback_json(&path, &repo)?;
+        println!("exported feedback: {path}");
+    }
+    Ok(())
+}
+
+fn append_run_evidence(run: &RetrievalRun, query_id: &str) -> anyhow::Result<()> {
+    let log = JsonlRetrievalRunLog::open(&format!("{STORE_DIR}/{RETRIEVAL_RUN_LOG_FILE}"));
+    log.append(&RetrievalRunEvidence::from_run(run, query_id))
+}
+
+fn print_feedback_report(report: &FeedbackReport) {
+    println!("== feedback report ==");
+    println!("report id      : {}", report.id);
+    println!("generated at   : {}", report.generated_at);
+    println!("total feedback : {}", report.total_feedback);
+    println!("problem queries: {}", report.problematic_queries.len());
+    for q in &report.problematic_queries {
+        println!(
+            "  - {} bad={} good={} bad-ratio={:.2} modes={}",
+            q.query_id,
+            q.bad_count,
+            q.good_count,
+            q.bad_ratio,
+            q.search_modes
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        println!("    {}", q.question_text);
+    }
+    println!(
+        "downvoted chunks: {}",
+        report.frequently_downvoted_chunks.len()
+    );
+    for c in &report.frequently_downvoted_chunks {
+        println!(
+            "  - {} bad={} queries={} {}",
+            c.chunk_id, c.bad_count, c.distinct_query_count, c.source_path
+        );
+    }
+    println!(
+        "no-good queries : {}",
+        report.queries_with_no_good_result.len()
+    );
+    for q in &report.queries_with_no_good_result {
+        println!(
+            "  - {} feedback={} good={}",
+            q.query_id, q.total_feedback, q.good_count
+        );
+        println!("    {}", q.question_text);
+    }
+    println!(
+        "rechunking candidates: {}",
+        report.candidates_for_rechunking.len()
+    );
+    for c in &report.candidates_for_rechunking {
+        println!(
+            "  - {} chunks={} {}",
+            c.document_id, c.downvoted_chunk_count, c.source_path
+        );
+    }
 }
 
 fn print_context(run: &RetrievalRun) {

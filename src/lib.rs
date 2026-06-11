@@ -4,6 +4,7 @@
 
 pub mod answer_generation;
 pub mod evaluation;
+pub mod feedback;
 pub mod ingestion;
 pub mod lexical_index;
 pub mod retrieval;

@@ -15,9 +15,11 @@ Lightweight ADRs for tovli. One file per decision, numbered sequentially. Format
 | [0008](0008-citation-protocol-and-no-answer-policy.md) | Citation protocol (chunk-id tags) and the no-answer / exit-code policy | Accepted | M4 |
 | [0009](0009-hybrid-search-rrf.md) | Hybrid search uses local keyword candidates and application-level RRF | Accepted | M5 |
 | [0010](0010-committed-release-versions.md) | Publish crates from committed semantic release versions | Accepted | Release Automation |
+| [0011](0011-feedback-as-retrieval-observability.md) | Feedback is append-only retrieval observability, not automatic ranking input | Accepted | M6 |
 
 > ADRs 0001–0003 were produced during the **M2 — Retrieval CLI** SPARC Architecture phase
 > (`docs/sparc/m2-retrieval-cli/03-architecture.md`).
 > ADRs 0004–0005 during **M3 — Retrieval Evaluation** (`docs/sparc/m3-retrieval-eval/03-architecture.md`).
 > ADRs 0006–0008 during **M4 — RAG Answer Generation** (`docs/sparc/m4-rag-answer-generation/03-architecture.md`).
 > ADR 0009 captures the **M5 — Hybrid Search** architecture decision from the PRD.
+> ADR 0011 captures the **M6 — Feedback and Retrieval Debugging** architecture decision from the PRD.
