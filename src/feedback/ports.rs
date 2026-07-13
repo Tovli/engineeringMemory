@@ -4,6 +4,7 @@ use crate::feedback::domain::{FeedbackItem, FeedbackQuery, RetrievalRunEvidence}
 
 pub trait FeedbackRepository {
     fn save(&self, item: &FeedbackItem) -> anyhow::Result<()>;
+    fn save_many(&self, items: &[FeedbackItem]) -> anyhow::Result<()>;
     fn find_by_id(&self, id: &str) -> anyhow::Result<Option<FeedbackItem>>;
     fn find_all(&self, query: Option<FeedbackQuery>) -> anyhow::Result<Vec<FeedbackItem>>;
 }

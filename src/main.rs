@@ -14,7 +14,8 @@ use tovli::evaluation::infra::dataset_loader::load_dataset;
 use tovli::evaluation::infra::report_writer::write_report;
 use tovli::evaluation::infra::retrieval_search_adapter::RetrievalSearchAdapter;
 use tovli::feedback::application::{
-    next_query_run_ids, FeedbackReportService, FeedbackService, RecordFeedbackInput,
+    next_feedback_ids, next_query_run_ids, FeedbackReportService, FeedbackService,
+    RecordFeedbackInput,
 };
 use tovli::feedback::domain::{FeedbackRating, FeedbackReport, RetrievalRunEvidence};
 use tovli::feedback::infra::{export_feedback_json, JsonlRetrievalRunLog, RedbFeedbackRepository};
@@ -315,14 +316,20 @@ fn run_search(args: SearchArgs) -> anyhow::Result<()> {
         top_k: args.top_k,
         embedding_model: model,
     };
+    let ids = next_query_run_ids(chrono::Utc::now().timestamp_millis());
+    let query_id = ids.query_id;
+    let run_id = ids.retrieval_run_id;
+    let now = chrono::Utc::now().to_rfc3339();
 
     let lookup = RedbDocumentLookup::open(&format!("{STORE_DIR}/documents.redb"))?;
 
     // Size the vector store by the indexed model so we never open it with a wrong dimension.
     // No active document ⇒ empty index (AC-8) — report and exit 0 without opening the store.
     let Some(indexed) = lookup.indexed_model_version()? else {
-        print_header(&query);
-        println!("index is empty — run `tovli ingest <folder>` first");
+        let run = empty_retrieval_run(&query, &run_id, &now);
+        append_run_evidence(&run, &query_id)?;
+        println!("query-id: {query_id}   run-id: {run_id}");
+        print_results(&run);
         return Ok(());
     };
     let store =
@@ -335,10 +342,6 @@ fn run_search(args: SearchArgs) -> anyhow::Result<()> {
         keyword: &keyword,
         lookup: &lookup,
     };
-    let ids = next_query_run_ids(chrono::Utc::now().timestamp_millis());
-    let query_id = ids.query_id;
-    let run_id = ids.retrieval_run_id;
-    let now = chrono::Utc::now().to_rfc3339();
     let run = svc.search(&query, args.explain, &run_id, &now)?; // mismatch (AC-7) surfaces here
     append_run_evidence(&run, &query_id)?;
     println!("query-id: {query_id}   run-id: {run_id}");
@@ -525,11 +528,19 @@ fn run_ask(args: AskArgs) -> anyhow::Result<()> {
         top_k: args.top_k,
         embedding_model: model,
     };
+    let ts = chrono::Utc::now().timestamp_millis();
+    let ids = next_query_run_ids(ts);
+    let query_id = ids.query_id;
+    let run_id = ids.retrieval_run_id;
+    let now = chrono::Utc::now().to_rfc3339();
     print_header(&query);
 
     let lookup = RedbDocumentLookup::open(&format!("{STORE_DIR}/documents.redb"))?;
     // Empty index (no active document) → nothing to ground an answer on (AC-2 territory) — exit 0.
     let Some(indexed) = lookup.indexed_model_version()? else {
+        let run = empty_retrieval_run(&query, &run_id, &now);
+        append_run_evidence(&run, &query_id)?;
+        println!("query-id: {query_id}   run-id: {run_id}");
         println!("index is empty — run `tovli ingest <folder>` first");
         return Ok(());
     };
@@ -543,11 +554,6 @@ fn run_ask(args: AskArgs) -> anyhow::Result<()> {
         keyword: &keyword,
         lookup: &lookup,
     };
-    let ts = chrono::Utc::now().timestamp_millis();
-    let ids = next_query_run_ids(ts);
-    let query_id = ids.query_id;
-    let run_id = ids.retrieval_run_id;
-    let now = chrono::Utc::now().to_rfc3339();
     let run = svc.search(&query, false, &run_id, &now)?; // model mismatch surfaces here
     append_run_evidence(&run, &query_id)?;
     println!("query-id: {query_id}   run-id: {run_id}");
@@ -607,14 +613,15 @@ fn run_feedback(args: FeedbackArgs) -> anyhow::Result<()> {
     let seed = chrono::Utc::now()
         .timestamp_nanos_opt()
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() * 1_000_000);
+    let feedback_ids = next_feedback_ids(seed, args.good.len() + args.bad.len());
     let inputs: Vec<RecordFeedbackInput> = args
         .good
         .iter()
         .map(|id| (FeedbackRating::Good, id))
         .chain(args.bad.iter().map(|id| (FeedbackRating::Bad, id)))
-        .enumerate()
-        .map(|(i, (rating, chunk_id))| RecordFeedbackInput {
-            feedback_id: format!("fb_{seed}_{i}"),
+        .zip(feedback_ids)
+        .map(|((rating, chunk_id), feedback_id)| RecordFeedbackInput {
+            feedback_id,
             query_id: args.query_id.clone(),
             retrieval_run_id: run_id.clone(),
             chunk_id: chunk_id.clone(),
@@ -654,11 +661,40 @@ fn append_run_evidence(run: &RetrievalRun, query_id: &str) -> anyhow::Result<()>
     log.append(&RetrievalRunEvidence::from_run(run, query_id))
 }
 
+fn empty_retrieval_run(query: &Query, run_id: &str, now: &str) -> RetrievalRun {
+    RetrievalRun {
+        id: run_id.to_string(),
+        query: query.clone(),
+        results: vec![],
+        search_mode: query.mode,
+        top_k: query.top_k,
+        latency_ms: 0,
+        below_threshold_count: 0,
+        reason: RunReason::IndexEmpty,
+        explain: None,
+        completed_at: now.to_string(),
+    }
+}
+
 fn print_feedback_report(report: &FeedbackReport) {
     println!("== feedback report ==");
     println!("report id      : {}", report.id);
     println!("generated at   : {}", report.generated_at);
     println!("total feedback : {}", report.total_feedback);
+    println!("observations    : {}", report.observations.len());
+    for o in &report.observations {
+        println!(
+            "  - {} {} {} run={} rank={} score={:.4} mode={} {}",
+            o.feedback_id,
+            o.rating,
+            o.chunk_id,
+            o.retrieval_run_id,
+            o.rank,
+            o.score,
+            o.search_mode,
+            o.source_path
+        );
+    }
     println!("problem queries: {}", report.problematic_queries.len());
     for q in &report.problematic_queries {
         println!(

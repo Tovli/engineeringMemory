@@ -16,6 +16,7 @@ Lightweight ADRs for tovli. One file per decision, numbered sequentially. Format
 | [0009](0009-hybrid-search-rrf.md) | Hybrid search uses local keyword candidates and application-level RRF | Accepted | M5 |
 | [0010](0010-committed-release-versions.md) | Publish crates from committed semantic release versions | Accepted | Release Automation |
 | [0011](0011-feedback-as-retrieval-observability.md) | Feedback is append-only retrieval observability, not automatic ranking input | Accepted | M6 |
+| [0012](0012-local-api-thin-adapter-over-services.md) | The local API is a thin async adapter over the existing application services | Proposed | M7 |
 
 > ADRs 0001–0003 were produced during the **M2 — Retrieval CLI** SPARC Architecture phase
 > (`docs/sparc/m2-retrieval-cli/03-architecture.md`).
@@ -23,3 +24,4 @@ Lightweight ADRs for tovli. One file per decision, numbered sequentially. Format
 > ADRs 0006–0008 during **M4 — RAG Answer Generation** (`docs/sparc/m4-rag-answer-generation/03-architecture.md`).
 > ADR 0009 captures the **M5 — Hybrid Search** architecture decision from the PRD.
 > ADR 0011 captures the **M6 — Feedback and Retrieval Debugging** architecture decision from the PRD.
+> ADR 0012 proposes the **M7 — Local API** architecture decision ahead of its SPARC cycle (status `Proposed`).

@@ -65,6 +65,14 @@ fn parse_first_chunk(stdout: &str) -> String {
     stdout[start + 1..end].to_string()
 }
 
+fn read_run_log(root: &Path) -> Vec<serde_json::Value> {
+    let body = std::fs::read_to_string(root.join(".tovli").join("retrieval-runs.jsonl")).unwrap();
+    body.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
 #[test]
 fn cli_records_feedback_for_a_search_result_and_exports_it() {
     let project = TempProject::new();
@@ -102,6 +110,14 @@ fn cli_records_feedback_for_a_search_result_and_exports_it() {
         &["feedback-report", "--export", export_path.to_str().unwrap()],
     );
     assert!(report.contains("total feedback : 1"));
+    assert!(
+        report.contains("observations    : 1"),
+        "report should print observation details:\n{report}"
+    );
+    assert!(
+        report.contains(&format!("run={run_id} rank=1 score=1.0000 mode=vector")),
+        "report should print run/rank/score/mode details:\n{report}"
+    );
 
     let exported: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(export_path).unwrap()).unwrap();
@@ -149,6 +165,38 @@ fn cli_lists_no_good_queries_in_feedback_report() {
         report.contains(body),
         "report should list the no-good question text:\n{report}"
     );
+}
+
+#[test]
+fn search_on_empty_index_prints_ids_and_persists_empty_run_evidence() {
+    let project = TempProject::new();
+
+    let search = run(&project.root, &["search", "anything", "--mock"]);
+    let query_id = parse_field(&search, "query-id:");
+    let run_id = parse_field(&search, "run-id:");
+    assert!(search.contains("index is empty"));
+
+    let runs = read_run_log(&project.root);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["queryId"], query_id);
+    assert_eq!(runs[0]["retrievalRunId"], run_id);
+    assert_eq!(runs[0]["results"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn ask_on_empty_index_prints_ids_and_persists_empty_run_evidence() {
+    let project = TempProject::new();
+
+    let ask = run(&project.root, &["ask", "anything", "--mock", "--no-llm"]);
+    let query_id = parse_field(&ask, "query-id:");
+    let run_id = parse_field(&ask, "run-id:");
+    assert!(ask.contains("index is empty"));
+
+    let runs = read_run_log(&project.root);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["queryId"], query_id);
+    assert_eq!(runs[0]["retrievalRunId"], run_id);
+    assert_eq!(runs[0]["results"].as_array().unwrap().len(), 0);
 }
 
 #[test]

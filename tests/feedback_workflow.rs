@@ -4,10 +4,15 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use tovli::feedback::application::next_query_run_ids;
+use std::cell::{Cell, RefCell};
+
+use tovli::feedback::application::{next_feedback_ids, next_query_run_ids};
 use tovli::feedback::application::{FeedbackReportService, FeedbackService, RecordFeedbackInput};
-use tovli::feedback::domain::{FeedbackRating, RetrievalRunEvidence, RetrievedChunkEvidence};
+use tovli::feedback::domain::{
+    FeedbackItem, FeedbackQuery, FeedbackRating, RetrievalRunEvidence, RetrievedChunkEvidence,
+};
 use tovli::feedback::infra::{export_feedback_json, JsonlRetrievalRunLog, RedbFeedbackRepository};
+use tovli::feedback::ports::FeedbackRepository;
 use tovli::retrieval::domain::SearchMode;
 
 const NOW: &str = "2026-06-10T00:00:00Z";
@@ -271,7 +276,147 @@ fn report_surfaces_problem_queries_downvoted_chunks_no_good_results_and_rechunki
 fn generated_query_and_run_ids_are_unique_within_the_same_millisecond() {
     let first = next_query_run_ids(1_780_000_000_000);
     let second = next_query_run_ids(1_780_000_000_000);
+    let expected_query_prefix = format!("qry_1780000000000_{}_", std::process::id());
+    let expected_run_prefix = format!("rrun_1780000000000_{}_", std::process::id());
 
+    assert!(first.query_id.starts_with(&expected_query_prefix));
+    assert!(first.retrieval_run_id.starts_with(&expected_run_prefix));
+    assert_eq!(
+        first.query_id.strip_prefix("qry_"),
+        first.retrieval_run_id.strip_prefix("rrun_")
+    );
     assert_ne!(first.query_id, second.query_id);
     assert_ne!(first.retrieval_run_id, second.retrieval_run_id);
+}
+
+#[test]
+fn generated_feedback_ids_include_timestamp_pid_sequence_and_batch_index() {
+    let ids = next_feedback_ids(1_780_000_000_000_000_000, 2);
+    let expected_prefix = format!("fb_1780000000000000000_{}_", std::process::id());
+
+    assert_eq!(ids.len(), 2);
+    assert!(ids[0].starts_with(&expected_prefix));
+    assert!(ids[1].starts_with(&expected_prefix));
+    assert!(ids[0].ends_with("_0"));
+    assert!(ids[1].ends_with("_1"));
+    assert_ne!(ids[0], ids[1]);
+}
+
+fn feedback_item(id: &str) -> FeedbackItem {
+    FeedbackItem {
+        id: id.into(),
+        query_id: "qry_1".into(),
+        retrieval_run_id: "rrun_1".into(),
+        chunk_id: "chunk_1".into(),
+        document_id: "doc_1".into(),
+        rating: FeedbackRating::Good,
+        note: None,
+        search_mode: SearchMode::Hybrid,
+        rank: 1,
+        score: 0.91,
+        source_path: "docs/deploy.md".into(),
+        question_text: "why did deployment fail?".into(),
+        created_at: NOW.into(),
+    }
+}
+
+#[test]
+fn redb_batch_conflict_does_not_persist_earlier_new_item() {
+    let paths = Paths::new();
+    let repo = RedbFeedbackRepository::open(&paths.feedback()).unwrap();
+    let existing = feedback_item("fb_existing");
+    let new_item = feedback_item("fb_new");
+
+    repo.save(&existing).unwrap();
+    let err = repo.save_many(&[new_item, existing.clone()]).unwrap_err();
+
+    assert!(err.to_string().contains("fb_existing"));
+    assert_eq!(repo.find_all(None).unwrap(), vec![existing]);
+}
+
+struct FailingBatchRepository {
+    saved: RefCell<Vec<FeedbackItem>>,
+    save_calls: Cell<usize>,
+}
+
+impl FailingBatchRepository {
+    fn new() -> Self {
+        Self {
+            saved: RefCell::new(Vec::new()),
+            save_calls: Cell::new(0),
+        }
+    }
+}
+
+impl FeedbackRepository for FailingBatchRepository {
+    fn save(&self, item: &FeedbackItem) -> anyhow::Result<()> {
+        let calls = self.save_calls.get();
+        self.save_calls.set(calls + 1);
+        if calls == 1 {
+            anyhow::bail!("simulated second-write failure");
+        }
+        self.saved.borrow_mut().push(item.clone());
+        Ok(())
+    }
+
+    fn save_many(&self, items: &[FeedbackItem]) -> anyhow::Result<()> {
+        self.save_calls.set(self.save_calls.get() + items.len());
+        anyhow::bail!("simulated second-write failure")
+    }
+
+    fn find_by_id(&self, _id: &str) -> anyhow::Result<Option<FeedbackItem>> {
+        Ok(None)
+    }
+
+    fn find_all(&self, _query: Option<FeedbackQuery>) -> anyhow::Result<Vec<FeedbackItem>> {
+        Ok(self.saved.borrow().clone())
+    }
+}
+
+#[test]
+fn record_many_does_not_partially_persist_when_repository_batch_save_fails() {
+    let paths = Paths::new();
+    let runs = JsonlRetrievalRunLog::open(&paths.runs());
+    runs.append(&evidence(
+        "rrun_1",
+        "qry_1",
+        "why did deployment fail?",
+        vec![
+            chunk("chunk_a", "doc_a", "docs/deploy.md", 1, 0.91),
+            chunk("chunk_b", "doc_a", "docs/deploy.md", 2, 0.80),
+        ],
+    ))
+    .unwrap();
+
+    let repo = FailingBatchRepository::new();
+    let service = FeedbackService {
+        feedback: &repo,
+        runs: &runs,
+    };
+
+    let err = service
+        .record_many(vec![
+            RecordFeedbackInput {
+                feedback_id: "fb_1".into(),
+                query_id: "qry_1".into(),
+                retrieval_run_id: "rrun_1".into(),
+                chunk_id: "chunk_a".into(),
+                rating: FeedbackRating::Good,
+                note: None,
+                created_at: NOW.into(),
+            },
+            RecordFeedbackInput {
+                feedback_id: "fb_2".into(),
+                query_id: "qry_1".into(),
+                retrieval_run_id: "rrun_1".into(),
+                chunk_id: "chunk_b".into(),
+                rating: FeedbackRating::Bad,
+                note: None,
+                created_at: NOW.into(),
+            },
+        ])
+        .unwrap_err();
+
+    assert!(err.to_string().contains("simulated second-write failure"));
+    assert_eq!(repo.saved.borrow().len(), 0);
 }

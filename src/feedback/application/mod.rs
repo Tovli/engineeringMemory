@@ -28,6 +28,14 @@ pub fn next_query_run_ids(timestamp_millis: i64) -> QueryRunIds {
     }
 }
 
+pub fn next_feedback_ids(timestamp_nanos: i64, count: usize) -> Vec<String> {
+    let seq = ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    (0..count)
+        .map(|batch_index| format!("fb_{timestamp_nanos}_{pid}_{seq}_{batch_index}"))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordFeedbackInput {
     pub feedback_id: String,
@@ -51,7 +59,7 @@ impl<F: FeedbackRepository, R: RetrievalRunEvidenceStore> FeedbackService<'_, F,
             .into_iter()
             .next()
             .expect("one input produces one feedback item");
-        self.feedback.save(&item)?;
+        self.feedback.save_many(std::slice::from_ref(&item))?;
         Ok(item)
     }
 
@@ -60,9 +68,7 @@ impl<F: FeedbackRepository, R: RetrievalRunEvidenceStore> FeedbackService<'_, F,
         inputs: Vec<RecordFeedbackInput>,
     ) -> anyhow::Result<Vec<FeedbackItem>> {
         let items = self.build_items(&inputs)?;
-        for item in &items {
-            self.feedback.save(item)?;
-        }
+        self.feedback.save_many(&items)?;
         Ok(items)
     }
 
