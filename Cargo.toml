@@ -2,7 +2,7 @@
 name = "tovli"
 version = "1.0.2"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.88"
 description = "tovli — RuVector-based technical memory assistant"
 license = "MIT"
 default-run = "tovli"
@@ -17,21 +17,33 @@ name = "verify-onnx"
 path = "src/bin/verify-onnx.rs"
 required-features = ["onnx"]
 
+[[bin]]
+name = "tovli-mcp"
+path = "src/bin/tovli-mcp.rs"
+required-features = ["mcp"]
+
 [features]
 default = ["onnx"]
+mcp = ["dep:rmcp", "dep:tokio", "dep:base64"]
 # Enables ruvector-core's local ONNX embeddings (MiniLM via ort + tokenizers).
 onnx = ["ruvector-core/onnx-embeddings", "dep:dirs", "dep:ureq"]
 
 [dependencies]
 anyhow = "1.0.102"
+base64 = { version = "0.22", optional = true }
 blake3 = "1.8.5"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 clap = { version = "4.5.61", features = ["derive"] }
 dirs = { version = "5.0.1", optional = true }
+fs2 = "0.4.3"
+image = { version = "0.24.9", default-features = false, features = ["png", "jpeg", "webp"] }
 pulldown-cmark = "0.13.4"
 redb = "2.2.0"
-ruvector-core = { version = "2.2.0", default-features = false, features = ["storage", "hnsw", "parallel"] }
+# Releases the embedded database when the last handle drops so CLI and MCP can share a store.
+ruvector-core = { version = "2.5.2", default-features = false, features = ["storage", "hnsw", "parallel"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+rmcp = { version = "=0.8.5", features = ["transport-io"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "io-std"], optional = true }
 ureq = { version = "2.12.1", optional = true }
 walkdir = "2.5.0"

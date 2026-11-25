@@ -277,6 +277,23 @@ impl SearchService<'_> {
             });
         }
 
+        let result_ids: Vec<_> = results.iter().map(|result| result.document_id.clone()).collect();
+        let assets = self.lookup.image_assets(&result_ids)?;
+        let selected: Vec<_> = results.iter()
+            .map(|result| (result.document_id.clone(), result.chunk_id.clone())).collect();
+        let attachments = self.lookup.image_attachments(&selected, query.filters.project.as_deref(), &query.filters.tags)?;
+        for result in &mut results {
+            if let Some((asset_id, available)) = assets.get(&result.document_id) {
+                result.metadata.insert("source_kind".into(), "image".into());
+                result.metadata.insert("asset_id".into(), asset_id.clone());
+                result.metadata.insert("asset_status".into(), if *available { "present" } else { "asset_missing" }.into());
+            }
+            if let Some((links, more)) = attachments.get(&result.chunk_id) {
+                result.metadata.insert("image_links".into(), serde_json::to_string(links)?);
+                result.metadata.insert("image_links_has_more".into(), more.to_string());
+            }
+        }
+
         let below_threshold_count =
             count_below_similarity_threshold(query.mode, results.iter().map(|r| r.score));
 

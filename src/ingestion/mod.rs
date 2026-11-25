@@ -8,5 +8,7 @@ pub mod ports;
 pub mod chunking;
 pub mod embedding;
 pub mod orchestrator;
+pub mod processing;
+pub mod durable;
 
 pub mod infra;

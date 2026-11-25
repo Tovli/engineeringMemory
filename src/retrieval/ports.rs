@@ -42,6 +42,16 @@ pub struct DocMeta {
     pub status: DocumentStatus,
 }
 
+/// A lightweight image attachment associated with a retrieval result.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImageAttachment {
+    pub link_id: String,
+    pub image_document_id: String,
+    pub asset_id: String,
+    pub caption: Option<String>,
+    pub anchor_state: String,
+}
+
 /// Read-only vector search over the index Ingestion populated (VectorStorePort, read side).
 pub trait VectorSearchPort {
     /// Top-`k` nearest neighbours by cosine distance. No native metadata filter is applied
@@ -58,6 +68,21 @@ pub trait KeywordSearchPort {
 pub trait DocumentLookupPort {
     /// Resolve metadata for the given document ids (ADR-0002 join).
     fn find_many(&self, ids: &[DocumentId]) -> anyhow::Result<HashMap<DocumentId, DocMeta>>;
+
+    /// Image asset availability for committed documents, without loading image bytes.
+    fn image_assets(&self, _ids: &[DocumentId]) -> anyhow::Result<HashMap<DocumentId, (String, bool)>> {
+        Ok(HashMap::new())
+    }
+
+    /// Return up to 20 image links per selected chunk, plus a flag for further links.
+    fn image_attachments(
+        &self,
+        _results: &[(String, String)],
+        _project: Option<&str>,
+        _tags: &[String],
+    ) -> anyhow::Result<HashMap<String, (Vec<ImageAttachment>, bool)>> {
+        Ok(HashMap::new())
+    }
 
     /// The embedding model the active index was built with, or `None` when no active
     /// document exists (empty index → AC-8). Used for the model-compatibility guard (R6/AC-7).

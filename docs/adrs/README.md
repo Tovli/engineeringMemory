@@ -17,6 +17,10 @@ Lightweight ADRs for tovli. One file per decision, numbered sequentially. Format
 | [0010](0010-committed-release-versions.md) | Publish crates from committed semantic release versions | Accepted | Release Automation |
 | [0011](0011-feedback-as-retrieval-observability.md) | Feedback is append-only retrieval observability, not automatic ranking input | Accepted | M6 |
 | [0012](0012-local-api-thin-adapter-over-services.md) | The local API is a thin async adapter over the existing application services | Proposed | M7 |
+| [0013](0013-mcp-document-ingestion.md) | Expose document ingestion to AI clients through a local MCP adapter | Proposed | AI-client ingestion |
+| [0014](0014-durable-single-document-ingestion.md) | Make single-document creation durable and safe to retry | Proposed | AI-client ingestion |
+| [0015](0015-image-memory-assets-and-search.md) | Preserve original images and index their text representations | Proposed | Image memory |
+| [0016](0016-text-image-attachments.md) | Link text and image memories through explicit attachment records | Proposed | Image memory |
 
 > ADRs 0001–0003 were produced during the **M2 — Retrieval CLI** SPARC Architecture phase
 > (`docs/sparc/m2-retrieval-cli/03-architecture.md`).
@@ -25,3 +29,8 @@ Lightweight ADRs for tovli. One file per decision, numbered sequentially. Format
 > ADR 0009 captures the **M5 — Hybrid Search** architecture decision from the PRD.
 > ADR 0011 captures the **M6 — Feedback and Retrieval Debugging** architecture decision from the PRD.
 > ADR 0012 proposes the **M7 — Local API** architecture decision ahead of its SPARC cycle (status `Proposed`).
+> ADRs 0013-0016 propose **AI-client ingestion and image memory** (all `Proposed`).
+> ADR 0013 owns MCP transport/tools and requires ADR 0014's durable application operation.
+> ADR 0015 owns original image assets and text-based search; ADR 0016 owns text-image relationships.
+> The current worktree includes text and image MCP ingestion. Text tools depend on ADRs 0013-0014.
+> Image and attachment tools also depend on ADRs 0015-0016. Release packaging is open.

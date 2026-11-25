@@ -54,7 +54,7 @@ additional source connectors.
 
 ## Requirements
 
-- Rust 1.77 or newer.
+- Rust 1.88 or newer, required by the current RuVector and ONNX dependencies.
 - The repository-pinned Rust toolchain in `rust-toolchain.toml`.
 - On Windows, Visual Studio C++ Build Tools with the Windows SDK.
 
@@ -120,6 +120,46 @@ tovli ask <query> [--top-k <n>] [--mode vector|keyword|hybrid] [--show-context] 
 
 Default mode is `vector`. `keyword` uses the local full-chunk keyword index.
 `hybrid` fuses vector and keyword ranks with Reciprocal Rank Fusion.
+
+## Local MCP Server
+
+Build the optional stdio server with:
+
+```powershell
+cargo build --release --features mcp --bin tovli-mcp
+```
+
+In your MCP client's configuration, add an entry using absolute paths:
+
+```json
+{
+  "mcpServers": {
+    "tovli": {
+      "command": "C:/path/to/tovli/target/release/tovli-mcp.exe",
+      "args": ["--store-dir", "C:/path/to/workspace/.tovli"]
+    }
+  }
+}
+```
+
+Point `--store-dir` at the `.tovli` directory in the CLI's working directory
+to share the same index. The CLI and MCP server take a temporary lock for each
+store operation. A caller receives retryable `store_in_use` after a five-second
+wait. Use compatible versions of both binaries.
+
+An MCP client can call `tovli_add_document` with a unique `source_key`,
+`content`, and optional `title`, `project`, `tags`, and JSON `metadata`.
+`tovli_query` retrieves a saved memory by exact key. Repeating an identical
+save returns the original receipt. Reusing a key for different content or
+metadata returns `source_conflict`.
+
+Image tools accept a PNG, JPEG, or WebP image encoded as base64, plus a
+description and optional OCR and context. `tovli_get_image` returns the
+original bytes. Use `tovli_link_image` and `tovli_list_image_links` to connect
+image memories and text documents.
+
+For offline tests, build with `--no-default-features --features mcp` and add
+`--mock` to the server arguments. Use a separate store for mock embeddings.
 
 ## Embedding Providers
 
