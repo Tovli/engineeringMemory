@@ -187,7 +187,19 @@ const RETRIEVAL_RUN_LOG_FILE: &str = "retrieval-runs.jsonl";
 const FEEDBACK_FILE: &str = "feedback.redb";
 
 fn main() -> anyhow::Result<()> {
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    let _store_lock = if matches!(command, Command::Spike) {
+        None
+    } else {
+        Some(tovli::store_lock::StoreLock::acquire(
+            std::path::Path::new(STORE_DIR),
+            std::time::Duration::from_secs(5),
+        )?)
+    };
+    if let Some(lock) = &_store_lock {
+        tovli::ingestion::durable::recover_locked(&lock.path)?;
+    }
+    match command {
         Command::Spike => run_spike(),
         Command::Ingest(args) => run_ingest(args),
         Command::Search(args) => run_search(args),
@@ -391,6 +403,12 @@ fn print_results(run: &RetrievalRun) {
     }
     for r in &run.results {
         println!("#{:<2} score={:.4}  {}", r.rank, r.score, r.source_path);
+        if let (Some(asset), Some(status)) = (r.metadata.get("asset_id"), r.metadata.get("asset_status")) {
+            println!("      image: {asset}  ({status})");
+        }
+        if let Some(links) = r.metadata.get("image_links") {
+            println!("      image links: {links}");
+        }
         if !r.heading_path.is_empty() {
             println!("      {}", r.heading_path.join(" > "));
         }

@@ -1,0 +1,586 @@
+{
+  "schema_version": "1.0",
+  "metadata": {
+    "id": "TOVLI-ADR-0012-0016",
+    "title": "tovli architecture decisions",
+    "version": "v3",
+    "as_of": "2026-11-24",
+    "stage": "Implementation planning",
+    "domain": "Local engineering memory",
+    "latest_change": "Aligned the plan with the amended ADRs. Clarified image lookup, CLI scope, and the HTTP lock and error contract.",
+    "immediate_ask": {
+      "status": "none",
+      "description": "All five ADR review answers are recorded.",
+      "owner": "",
+      "due_date": null,
+      "linked_ids": []
+    }
+  },
+  "overview": {
+    "objective": "Deliver text and image ingestion from a local AI client in the current worktree, with durable saves and retrieval of original images.",
+    "user_need": "Save notes and images directly from an AI client, find them through tovli, and recover safely after a lost response. Inspect an original screenshot or diagram and associate it with the notes it supports.",
+    "today": "The CLI ingests local folders and searches vector and keyword indexes. Folder ingestion also reconciles missing files. The MCP tools and local HTTP API are proposals.",
+    "plain_language_solution": "Use one durable storage policy for both text and image ingestion. Preserve verified originals and search their descriptions and optional OCR. Link saved memories with explicit, captioned attachments. Apply the same store-access policy to the separately scoped HTTP adapter.",
+    "why_now": "Text and image ingestion share the CLI’s embedded store. A per-operation lock and journaled recovery let local processes access it safely and resume interrupted saves."
+  },
+  "plan_now": {
+    "as_of": "2026-11-24",
+    "current_agreed_plan": "Both text and image ingestion are goals for the current worktree and can be implemented as separate tasks (0013). Use journaled creation and a per-operation store lock (0014), preserve verified originals and search their supplied text (0015), and represent attachments as explicit links with stale-anchor reporting (0016). The separate local HTTP adapter uses the same store policy (0012). Release packaging is open.",
+    "visual_examples": [
+      {
+        "id": "V-INDEX",
+        "title": "Working-tree ADR index",
+        "kind": "other",
+        "url": "../docs/adrs/README.md",
+        "description": "Source statuses and implementation dependencies for ADRs 0012–0016. Individual ADRs are linked in Steps → Records."
+      },
+      {
+        "id": "V-WALKTHROUGH",
+        "title": "Memory workflow walkthrough",
+        "kind": "diagram",
+        "url": "../artifacts/tovli-memory-adr-walkthrough.html",
+        "description": "The walkthrough simulates the proposed operations. Its stages illustrate implementation order. Release packaging remains open."
+      }
+    ],
+    "user_journey": [
+      {
+        "sequence": 1,
+        "actor": "AI client",
+        "action": "Save an incident note from a local AI client",
+        "response": "tovli_add_document accepts a source key, text, and optional JSON metadata. Tovli parses, embeds, and indexes the note locally.",
+        "outcome": "The client receives a receipt after the document and its indexes are ready for retrieval.",
+        "linked_decision_ids": ["ADR-0013", "ADR-0014"]
+      },
+      {
+        "sequence": 2,
+        "actor": "AI client or CLI",
+        "action": "Confirm a save or find the note again",
+        "response": "tovli_query checks the exact source key. An identical save after a lost response returns the original receipt. CLI search can retrieve the note from the same store.",
+        "outcome": "The client can confirm a commit, and a repeated save preserves document and chunk counts.",
+        "linked_decision_ids": ["ADR-0013", "ADR-0014"]
+      },
+      {
+        "sequence": 3,
+        "actor": "AI client and CLI",
+        "action": "Save a screenshot and find it again",
+        "response": "The AI client supplies image bytes and a description, with optional OCR and context. The client can look up the image by exact source key. CLI search finds image memories by description or OCR. tovli_get_image fetches the original by asset ID.",
+        "outcome": "The original remains available for visual inspection.",
+        "linked_decision_ids": ["ADR-0013", "ADR-0015"]
+      },
+      {
+        "sequence": 4,
+        "actor": "AI client",
+        "action": "Link the screenshot to an incident note or a specific passage",
+        "response": "Call tovli_link_image with the committed text and image document IDs and an optional caption or chunk anchor. A single user request can have the client perform the saves and the link call. List links from either endpoint and fetch a selected original on demand.",
+        "outcome": "One screenshot can support multiple notes with a different caption for each relationship.",
+        "linked_decision_ids": ["ADR-0013", "ADR-0015", "ADR-0016"]
+      }
+    ],
+    "success_measures": [
+      {
+        "id": "M-TEXT",
+        "metric": "Committed text survives an interrupted write or lost response",
+        "target": "One searchable document after recovery, with its original receipt on exact retry.",
+        "measured_by": "Failure injection between writes and restart tests with a shared CLI/MCP store."
+      },
+      {
+        "id": "M-IMAGE",
+        "metric": "Image memories are discoverable and originals remain intact",
+        "target": "Description and OCR queries find matching images. Explicit fetch returns identical original bytes after restart and backup restore.",
+        "measured_by": "Representative queries and byte-hash checks. The recall target remains open."
+      },
+      {
+        "id": "M-LINK",
+        "metric": "Attachment navigation preserves context in both directions",
+        "target": "Correct captions, target filters and pagination, stable search rank, and a warning for missing chunk anchors.",
+        "measured_by": "Link, search enrichment, and endpoint lifecycle integration tests."
+      }
+    ],
+    "edge_cases": [
+      {
+        "scenario": "A key is reused with different fields or source kind",
+        "expected_behavior": "Return source_conflict and preserve committed data. An exact lookup verifies existence. An identical retry verifies payload identity."
+      },
+      {
+        "scenario": "A journal cannot replay under the required model configuration",
+        "expected_behavior": "Return recovery_required before serving store data. Resume recovery with the recorded configuration."
+      },
+      {
+        "scenario": "A long CLI ingest holds the shared lock",
+        "expected_behavior": "Wait up to five seconds, then return retryable store_in_use. An idle MCP connection leaves the store available."
+      },
+      {
+        "scenario": "A linked chunk disappears or its endpoint is deleted",
+        "expected_behavior": "Show a stale anchor in full-document expansion. Suppress links for deleted endpoints and preserve shared originals."
+      }
+    ],
+    "assumptions": [
+      {
+        "id": "A-SDK",
+        "statement": "A pinned Rust MCP SDK can support bounded stdio framing and the target client at the declared Rust 1.77 minimum.",
+        "status": "unverified",
+        "evidence": "ADR-0013 requires a compatibility check and an explicit Rust version change if needed."
+      },
+      {
+        "id": "A-RECALL",
+        "statement": "Client-supplied text will make representative engineering screenshots and diagrams discoverable.",
+        "status": "unverified",
+        "evidence": "ADR-0015 calls for description-only and description-plus-OCR evaluation."
+      }
+    ],
+    "supporting_links": []
+  },
+  "decide": {
+    "questions": [
+      {
+        "id": "ADR-0014",
+        "question": "Use journaled creation and a temporary shared-store lock?",
+        "today": "Folder ingestion couples processing with reconciliation. Document, vector, chunk-map, and keyword writes span stores, and vectors can be written before the chunk map.",
+        "why_it_matters": "A lost response or a crash can leave ambiguous state. CLI and adapters may access the same directory while their processes stay running.",
+        "my_pick_option_id": "A",
+        "what_we_get": "Create-only identity uses mcp://local/{source_key} and a versioned fingerprint of content, normalized fields, source kind, and typed metadata. The journal records intended chunk IDs for recovery. The lock serializes store access, including reads.",
+        "if_we_skip_it": "The MCP save would lack the draft’s retry, visibility, and recovery guarantees. Reads and writes need a common coordination policy.",
+        "options": [
+          { "id": "A", "description": "Use ADR-0014’s durable create, fingerprint, journal, and per-operation lock.", "tradeoff": "Makes repeated saves predictable and lets an idle adapter release the store. Active operations serialize and waiting callers can time out after five seconds." },
+          { "id": "B", "description": "Reuse folder ingest and its content-hash shortcut for a single item.", "tradeoff": "Reuses the current entry point, with folder reconciliation and incomplete coverage of metadata changes or partial writes." },
+          { "id": "C", "description": "Keep exclusive ownership for the lifetime of the server.", "tradeoff": "Simplifies process ownership. CLI access to the same store would wait for the server to exit." }
+        ],
+        "selected_option_id": "A",
+        "status": "settled",
+        "blocking": false,
+        "decided_by": "User",
+        "decided_at": "2026-11-24T16:49:02+02:00",
+        "provenance": "../docs/adrs/0014-durable-single-document-ingestion.md · Proposed in the working tree. Option A summarizes the draft recommendation.",
+        "related_step_ids": ["S-DURABLE", "S-MCP-TEXT", "S-IMAGE", "S-LINK", "S-HTTP"]
+      },
+      {
+        "id": "ADR-0013",
+        "question": "What should the current local MCP worktree deliver?",
+        "today": "The CLI ingests files from a folder. The proposed HTTP API has no ingestion route. ADR-0013 proposes an optional tovli-mcp binary over ADR-0014.",
+        "why_it_matters": "The transport controls which clients can connect. Stable tool names, output schemas, and startup configuration form the initial public interface.",
+        "my_pick_option_id": "A",
+        "what_we_get": "Deliver the local MCP text and image ingestion paths in the current worktree. Implement and validate them as separate tasks where useful. Both use ADR-0014’s durable service and shared-store policy.",
+        "if_we_skip_it": "AI-client saves stay unavailable until another adapter provides durable ingestion. Remote transport would also need an access and authentication design.",
+        "options": [
+          { "id": "A", "description": "Use feature-gated local stdio, then extend the tool set after image and link support.", "tradeoff": "Keeps the two text tools independently deliverable. Requires a stdio-capable client, compatible pinned rmcp/Tokio versions, and bounded framing." },
+          { "id": "B", "description": "Start with Streamable HTTP.", "tradeoff": "Supports remote-only clients, with additional exposure and authentication design." },
+          { "id": "C", "description": "Proxy MCP through the proposed HTTP API.", "tradeoff": "Adds a dependency on an unimplemented API and requires an ingestion endpoint." },
+          { "id": "D", "description": "text and image ingestion can be on separate tasks but both are part of the current worktree goal", "tradeoff": "Keeps both ingestion paths in the delivery scope and allows separate implementation and verification." }
+        ],
+        "selected_option_id": "D",
+        "status": "settled",
+        "blocking": false,
+        "decided_by": "User",
+        "decided_at": "2026-11-24T16:49:02+02:00",
+        "note": "The decision sets the worktree scope. Release packaging is open.",
+        "provenance": "../docs/adrs/0013-mcp-document-ingestion.md · Proposed in the working tree. Option A summarizes the draft recommendation.",
+        "related_step_ids": ["S-MCP-TEXT", "S-IMAGE", "S-MCP-IMAGE"]
+      },
+      {
+        "id": "ADR-0015",
+        "question": "Preserve original images and search their supplied text?",
+        "today": "Tovli’s current embedding and parsing pipeline is text-based. ADR-0015 proposes separate image records and byte-deduplicated original assets.",
+        "why_it_matters": "Users need to find screenshots by meaning or OCR and inspect the original as evidence. Image recall depends on the supplied text.",
+        "my_pick_option_id": "A",
+        "what_we_get": "Store verified PNG, JPEG, or WebP originals by full byte hash. Index a versioned description plus optional OCR and context with provenance, using existing vector and keyword retrieval.",
+        "if_we_skip_it": "Description-only storage would lose the original evidence. A visual search model would introduce another indexing and ranking design.",
+        "options": [
+          { "id": "A", "description": "Retain verified originals and use text search first.", "tradeoff": "Reuses existing retrieval and preserves originals for inspection. Backups and recovery must cover assets, and spatial detail can be missed." },
+          { "id": "B", "description": "Keep descriptions only.", "tradeoff": "Avoids managing binary assets, at the cost of visual inspection and later reprocessing." },
+          { "id": "C", "description": "Require visual embeddings up front.", "tradeoff": "Could cover visual queries, with extra model, index, and relevance evaluation work before delivery." }
+        ],
+        "selected_option_id": "A",
+        "status": "settled",
+        "blocking": false,
+        "decided_by": "User",
+        "decided_at": "2026-11-24T16:49:02+02:00",
+        "provenance": "../docs/adrs/0015-image-memory-assets-and-search.md · Proposed in the working tree. Option A summarizes the draft recommendation.",
+        "related_step_ids": ["S-IMAGE", "S-LINK", "S-MCP-IMAGE"]
+      },
+      {
+        "id": "ADR-0016",
+        "question": "Store explicit many-to-many attachments with optional chunk anchors?",
+        "today": "One image can support several notes. Chunk IDs can disappear after a note is re-ingested. ADR-0016 proposes link records resolved through the image memory.",
+        "why_it_matters": "Captions are specific to a relationship. Reverse lookup, filtering, and anchor state determine what evidence a reader sees.",
+        "my_pick_option_id": "A",
+        "what_we_get": "Create links between active memory IDs with optional captions and chunk anchors. Update both lookup directions in one metadata transaction. Preserve stable IDs on exact retries.",
+        "if_we_skip_it": "Notes could mention images manually, with no managed reverse lookup or stale-anchor warning.",
+        "options": [
+          { "id": "A", "description": "Use explicit relationship records and report stale anchors.", "tradeoff": "Supports both navigation directions and per-link captions. A separate link call validates the saved endpoints and can be retried independently." },
+          { "id": "B", "description": "Infer attachments from Markdown paths.", "tradeoff": "Fits authoring conventions. Path changes can break links and there is no stable relationship identity." },
+          { "id": "C", "description": "Remap missing anchors automatically.", "tradeoff": "Can keep links attached after edits, with the risk of presenting evidence beside the wrong passage." }
+        ],
+        "selected_option_id": "A",
+        "status": "settled",
+        "blocking": false,
+        "decided_by": "User",
+        "decided_at": "2026-11-24T16:49:02+02:00",
+        "note": "tovli_link_image takes committed text and image IDs plus an optional caption and chunk anchor. A separate call lets a client reuse an existing image across notes and retry a failed link without saving either memory again. A client can perform all required tool calls from one user request.",
+        "provenance": "../docs/adrs/0016-text-image-attachments.md · Proposed in the working tree. Option A summarizes the draft recommendation.",
+        "related_step_ids": ["S-LINK", "S-MCP-IMAGE"]
+      },
+      {
+        "id": "ADR-0012",
+        "question": "Apply ADR-0014’s lock and recovery policy to the proposed HTTP API?",
+        "today": "The working-tree diff changes ADR-0012’s previous server-lifetime ownership assumption. Its thin, loopback HTTP adapter and application service contracts stay part of the M7 draft.",
+        "why_it_matters": "HTTP requests may open the same embedded stores as CLI or MCP operations. An ask request can also include a blocking LLM call, so its store access needs an explicit lifecycle.",
+        "my_pick_option_id": "A",
+        "what_we_get": "The CLI can use the store while the HTTP server stays up. Each store operation checks recovery and closes handles before releasing the shared lock. POST /ask releases it before the LLM call. HTTP 503 preserves distinct store_in_use and recovery_required codes.",
+        "if_we_skip_it": "M7 would keep a separate ownership model and operators would need to avoid overlapping CLI store access.",
+        "options": [
+          { "id": "A", "description": "Align local HTTP store operations with ADR-0014.", "tradeoff": "Uses one coordination policy across adapters. Specify timeout/error mapping and scope the lock around store-dependent work." },
+          { "id": "B", "description": "Keep the original HTTP server-lifetime store ownership.", "tradeoff": "Retains a simpler server ownership model. CLI writes to the same database would remain out of scope while the API runs." }
+        ],
+        "selected_option_id": "A",
+        "status": "settled",
+        "blocking": false,
+        "decided_by": "User",
+        "decided_at": "2026-11-24T16:49:02+02:00",
+        "provenance": "../docs/adrs/0012-local-api-thin-adapter-over-services.md · Proposed in the working tree. Option A summarizes the draft recommendation.",
+        "related_step_ids": ["S-HTTP"]
+      }
+    ],
+    "defaults": [],
+    "direct_decisions": [
+      {
+        "id": "ADR-0009",
+        "statement": "Accepted baseline · Retrieval remains read-only and supports vector, keyword, and hybrid ranking through the same document filters.",
+        "source": "docs/adrs/0009-hybrid-search-rrf.md"
+      },
+      {
+        "id": "ADR-0011",
+        "statement": "Accepted baseline · Feedback is append-only observability and uses persisted evidence of the results shown.",
+        "source": "docs/adrs/0011-feedback-as-retrieval-observability.md"
+      }
+    ],
+    "out_this_round": [
+      {
+        "id": "X-NETWORK",
+        "description": "Remote MCP, remote HTTP exposure, authentication, and multi-tenant access.",
+        "reason": "The drafts use local stdio or local loopback and rely on the local OS context.",
+        "revisit_when": "A remote access use case has its own exposure and authentication decision."
+      },
+      {
+        "id": "X-MUTATIONS",
+        "description": "Overwrite, delete, or bulk tools for logical sources, plus caption edits and unlinking.",
+        "reason": "The first mutation contracts are create-only with safe retries.",
+        "revisit_when": "A versioning or mutation contract covers compatibility and recovery."
+      },
+      {
+        "id": "X-RANKING",
+        "description": "Ranked MCP queries, custom metadata filters, and ranking changes from attachment captions.",
+        "reason": "MCP starts with exact lookup. Existing CLI ranking remains the retrieval baseline.",
+        "revisit_when": "A retrieval proposal defines selectors, ranking, and tests."
+      },
+      {
+        "id": "X-VISION",
+        "description": "Server-side OCR or vision, image embeddings, thumbnails, and automatic asset garbage collection.",
+        "reason": "The client supplies derived text and the store preserves originals.",
+        "revisit_when": "Image-search evaluation or an asset lifecycle proposal shows the need."
+      }
+    ]
+  },
+  "steps": {
+    "phases": [
+      {
+        "id": "S-DURABLE",
+        "sequence": 1,
+        "title": "Durable document service and store access",
+        "outcome": "Give adapters reusable single-document creation, exact lookup, and a common lock/recovery lifecycle.",
+        "depends_on": [],
+        "decision_ids": ["ADR-0014"],
+        "status": "not_started",
+        "commitment_status": "proposed",
+        "done_when": "Faults between every write recover to one searchable document. Identical retries preserve receipts and typed metadata. Aliased paths and crash exit obey the lock policy. The supported tovli ingest <folder> command and existing retrieval tests pass."
+      },
+      {
+        "id": "S-MCP-TEXT",
+        "sequence": 2,
+        "title": "Text ingestion over MCP",
+        "outcome": "Provide the optional tovli-mcp binary, two text tools, and client setup instructions for the current worktree.",
+        "depends_on": ["S-DURABLE"],
+        "decision_ids": ["ADR-0013", "ADR-0014"],
+        "status": "not_started",
+        "commitment_status": "proposed",
+        "done_when": "Pinned SDK and Rust version compile. A real stdio session validates receipts, hit/miss and error schemas, framing and queue limits, protocol-only stdout, and CLI/MCP contention in both directions."
+      },
+      {
+        "id": "S-IMAGE",
+        "sequence": 3,
+        "title": "Image ingestion and text search",
+        "outcome": "Provide the image ingestion service for the current worktree. Stage and recover verified originals while indexing a versioned description, optional OCR, and context.",
+        "depends_on": ["S-DURABLE"],
+        "decision_ids": ["ADR-0013", "ADR-0015", "ADR-0014"],
+        "status": "not_started",
+        "commitment_status": "proposed",
+        "done_when": "Shared bytes deduplicate across distinct memories, restore yields identical bytes, and representative queries measure description and OCR recall. Fault injection covers publication and index writes."
+      },
+      {
+        "id": "S-LINK",
+        "sequence": 4,
+        "title": "Attachment relationships",
+        "outcome": "Create and list captioned links using committed text and image endpoints.",
+        "depends_on": ["S-IMAGE"],
+        "decision_ids": ["ADR-0016", "ADR-0015", "ADR-0014"],
+        "status": "not_started",
+        "commitment_status": "proposed",
+        "done_when": "Forward and reverse indexes commit together. Retries, anchor checks, target filters, pagination, suppression, and unchanged ranks pass lifecycle tests."
+      },
+      {
+        "id": "S-MCP-IMAGE",
+        "sequence": 5,
+        "title": "MCP image and attachment tools",
+        "outcome": "Expose image add/fetch for the current worktree and wire up link create/list after the backing operations are ready.",
+        "depends_on": ["S-MCP-TEXT", "S-IMAGE", "S-LINK"],
+        "decision_ids": ["ADR-0013", "ADR-0015", "ADR-0016"],
+        "status": "not_started",
+        "commitment_status": "proposed",
+        "done_when": "A client adds both memories, queries the image key, links and lists in both directions, and fetches original bytes. A failed link call can be retried using the already committed document IDs. Invalid image, queue, frame, and endpoint inputs return documented errors."
+      },
+      {
+        "id": "S-HTTP",
+        "sequence": 6,
+        "title": "M7 HTTP shared-store integration",
+        "outcome": "Apply the common store-access policy to the separately scoped HTTP adapter.",
+        "depends_on": ["S-DURABLE"],
+        "decision_ids": ["ADR-0012", "ADR-0014"],
+        "status": "not_started",
+        "commitment_status": "proposed",
+        "done_when": "A running loopback API and CLI can share a store. Verify HTTP 503 with distinct store_in_use and recovery_required codes. A CLI operation can acquire the lock during the LLM call. The answer cites the captured retrieval results, and any answer-log write reacquires the lock."
+      }
+    ],
+    "how_we_test_it": {
+      "environment": "Offline integration tests with mock embeddings and isolated stores, plus supported Rust build checks and a smoke test in a stdio-capable client.",
+      "scenarios": [
+        "Crash between index writes, including vector insert before sidecar commit. Restart from either process and verify recovery before a read.",
+        "Exercise exact retries, changed metadata values or types, model mismatch, active and missing keys, and folder reconciliation over logical sources.",
+        "Verify idle access, contention in both directions, aliased paths, crash release, and lock wait behavior on a representative store.",
+        "Restore image bytes from backup, evaluate CLI description and OCR queries, then test stale anchors and deletion suppression.",
+        "In the separate M7 delivery, hold an HTTP ask request at the LLM call and verify that the CLI can use the store. Check recovery and contention error codes independently."
+      ],
+      "acceptance_criteria": [
+        "Validate the default build and the MCP build without default features. Run the supported Rust, serial test, and Clippy checks in ADR-0013.",
+        "Prove bounded framing before full buffering, protocol-only stdout, and stable schema/error results in a real stdio session.",
+        "Validate compatible binaries together before enabling access to an existing shared store."
+      ]
+    },
+    "where_it_ships": {
+      "target": "Optional local tovli-mcp binary in the existing crate, with a shared .tovli store. M7 HTTP remains a separate local delivery.",
+      "release_order": "Text and image ingestion are part of the same worktree goal. They can be built and validated as separate tasks in the dependency order shown above. Release packaging is open. HTTP integration needs the shared policy and can proceed independently of MCP.",
+      "release_trigger": "Both ingestion paths pass their implementation acceptance checks before the current worktree goal is complete.",
+      "rollout_strategy": "Use compatible CLI and MCP builds for the same store. Back up metadata, indexes, and image assets together under the lock when image support is in use.",
+      "rollback": "Compatibility with older binaries after new format writes is open. Verify backup restoration before relying on rollback."
+    },
+    "how_it_is_built": {
+      "approach": "Reuse the parse, chunk, embed, and persistence pipeline. Put recovery in the application/store layer. Keep protocol handling in thin adapters.",
+      "quality_gates": [
+        "Measure handle reopen and lock wait on a representative store before finalizing a shared-store release.",
+        "Check SDK framing support and Rust compatibility before pinning MCP dependencies.",
+        "Verify durable asset publication and restore before exposing image tools."
+      ],
+      "handoffs": [
+        "The durable service provides create and query operations to the text MCP worker, and store coordination to HTTP.",
+        "The image service provides committed image records and verified assets to relationship creation and MCP fetch."
+      ]
+    },
+    "risks": [
+      {
+        "id": "R-LOCK",
+        "description": "Long ingests or handle reopen costs can make short operations time out.",
+        "mitigation": "Measure contention and time spent under lock. Verify that HTTP ask releases the lock before generation and maps timeouts to retryable store_in_use.",
+        "linked_step_ids": ["S-DURABLE", "S-MCP-TEXT", "S-HTTP"]
+      },
+      {
+        "id": "R-RECOVERY",
+        "description": "Recovery can block all normal store operations if the recorded model configuration is unavailable.",
+        "mitigation": "Preserve the journal, return recovery_required, and prove recovery after the matching model is restored.",
+        "linked_step_ids": ["S-DURABLE", "S-IMAGE"]
+      },
+      {
+        "id": "R-SDK",
+        "description": "SDK framing or Rust compatibility may require a deliberate change to the adapter or declared minimum Rust version.",
+        "mitigation": "Check the pinned SDK before finalizing the tool contract. Record an explicit MSRV change if required.",
+        "linked_step_ids": ["S-MCP-TEXT", "S-MCP-IMAGE"]
+      },
+      {
+        "id": "R-IMAGE",
+        "description": "Text search can miss visual details, and committed image bytes can be missing or damaged.",
+        "mitigation": "Measure recall on real screenshot and diagram queries, test asset integrity and restore, and report missing originals explicitly.",
+        "linked_step_ids": ["S-IMAGE", "S-MCP-IMAGE"]
+      }
+    ],
+    "records": [
+      {
+        "id": "SRC-0012",
+        "kind": "ADR",
+        "title": "ADR-0012 · Shared store policy for the local HTTP API",
+        "url": "../docs/adrs/0012-local-api-thin-adapter-over-services.md",
+        "state_as_of": "Modified · Proposed"
+      },
+      {
+        "id": "SRC-0013",
+        "kind": "ADR",
+        "title": "ADR-0013 · Local MCP adapter and tools",
+        "url": "../docs/adrs/0013-mcp-document-ingestion.md",
+        "state_as_of": "New in working tree · Proposed"
+      },
+      {
+        "id": "SRC-0014",
+        "kind": "ADR",
+        "title": "ADR-0014 · Durable single-document ingestion and store lock",
+        "url": "../docs/adrs/0014-durable-single-document-ingestion.md",
+        "state_as_of": "New in working tree · Proposed"
+      },
+      {
+        "id": "SRC-0015",
+        "kind": "ADR",
+        "title": "ADR-0015 · Original image assets and text search",
+        "url": "../docs/adrs/0015-image-memory-assets-and-search.md",
+        "state_as_of": "New in working tree · Proposed"
+      },
+      {
+        "id": "SRC-0016",
+        "kind": "ADR",
+        "title": "ADR-0016 · Text–image attachments",
+        "url": "../docs/adrs/0016-text-image-attachments.md",
+        "state_as_of": "New in working tree · Proposed"
+      },
+      {
+        "id": "SRC-INDEX",
+        "kind": "Index",
+        "title": "ADR index",
+        "url": "../docs/adrs/README.md",
+        "state_as_of": "Modified · Lists proposal statuses and delivery dependencies"
+      },
+      {
+        "id": "SRC-0009",
+        "kind": "Baseline",
+        "title": "ADR-0009 · Hybrid search",
+        "url": "../docs/adrs/0009-hybrid-search-rrf.md",
+        "state_as_of": "Accepted"
+      },
+      {
+        "id": "SRC-0011",
+        "kind": "Baseline",
+        "title": "ADR-0011 · Feedback observability",
+        "url": "../docs/adrs/0011-feedback-as-retrieval-observability.md",
+        "state_as_of": "Accepted"
+      }
+    ]
+  },
+  "history": {
+    "events": [
+      {
+        "id": "H-DRAFTS",
+        "date": "2026-11-12",
+        "actor": "Working-tree ADRs 0013–0016",
+        "event_type": "proposal",
+        "summary": "The four new drafts carry this date and propose local AI-client ingestion, durable saves, image memories, and attachments.",
+        "affected_ids": ["ADR-0013", "ADR-0014", "ADR-0015", "ADR-0016"]
+      },
+      {
+        "id": "H-REVIEW",
+        "date": "2026-11-24",
+        "actor": "Workspace review",
+        "event_type": "snapshot",
+        "summary": "Captured all five Proposed ADRs, including the 0012 diff adopting 0014’s store coordination policy. The index records text and image delivery dependencies.",
+        "affected_ids": ["ADR-0012", "ADR-0013", "ADR-0014", "ADR-0015", "ADR-0016"]
+      },
+      {
+        "id": "H-ANSWERS",
+        "date": "2026-11-24",
+        "actor": "User",
+        "event_type": "decision",
+        "summary": "Selected A for durable creation and locking (0014), verified originals and text search (0015), explicit attachments (0016), and HTTP store policy alignment (0012). Submitted a custom worktree scope for 0013, recorded as D.",
+        "original_quote": "text and image ingestion can be on separate tasks but both are part of the current worktree goal",
+        "affected_ids": ["ADR-0014", "ADR-0013", "ADR-0015", "ADR-0016", "ADR-0012"]
+      },
+      {
+        "id": "H-LINK-NOTE",
+        "date": "2026-11-24",
+        "actor": "User",
+        "event_type": "feedback",
+        "summary": "Asked about the separate client call while selecting the explicit attachment model. The plan records its purpose and the option to perform the tool calls from one user request.",
+        "original_quote": "why do we need a separate client call?",
+        "affected_ids": ["ADR-0016"]
+      },
+      {
+        "id": "H-ADR-ALIGNMENT",
+        "date": "2026-11-24",
+        "actor": "Workspace review",
+        "event_type": "revision",
+        "summary": "Aligned the plan with the amended ADRs. Distinguished exact MCP lookup from CLI image search, recorded the supported folder command, and added HTTP lock and error verification.",
+        "affected_ids": ["ADR-0012", "ADR-0013", "ADR-0014", "ADR-0015"]
+      }
+    ],
+    "versions": [
+      {
+        "version": "v1",
+        "date": "2026-11-24",
+        "stage": "Architecture review",
+        "change_summary": "Initial Tovli Plan presentation of the uncommitted ADRs. No proposal approvals are recorded in this snapshot."
+      },
+      {
+        "version": "v2",
+        "date": "2026-11-24",
+        "stage": "Implementation planning",
+        "change_summary": "Recorded five review decisions and the text-plus-image worktree scope. Clarified the separate attachment call and retained the build dependencies."
+      },
+      {
+        "version": "v3",
+        "date": "2026-11-24",
+        "stage": "Implementation planning",
+        "change_summary": "Aligned delivery checks with the amended ADRs and clarified how users find saved image memories."
+      }
+    ]
+  },
+  "diagrams": [
+    {
+      "id": "G-STORE",
+      "title": "How the CLI and adapters would share the store",
+      "type": "architecture",
+      "description": "The CLI and MCP can stay connected while operations take turns. M7 HTTP uses the same coordination policy as a separate adapter.",
+      "nodes": [
+        {
+          "id": "cli",
+          "label": "Folder CLI"
+        },
+        {
+          "id": "mcp",
+          "label": "Local MCP"
+        },
+        {
+          "id": "http",
+          "label": "M7 HTTP"
+        },
+        {
+          "id": "lock",
+          "label": "Store lock and recovery"
+        },
+        {
+          "id": "stores",
+          "label": "Local indexes and assets"
+        }
+      ],
+      "edges": [
+        {
+          "from": "cli",
+          "to": "lock"
+        },
+        {
+          "from": "mcp",
+          "to": "lock"
+        },
+        {
+          "from": "http",
+          "to": "lock"
+        },
+        {
+          "from": "lock",
+          "to": "stores"
+        }
+      ],
+      "related_decision_ids": ["ADR-0012", "ADR-0013", "ADR-0014", "ADR-0015"]
+    }
+  ]
+}

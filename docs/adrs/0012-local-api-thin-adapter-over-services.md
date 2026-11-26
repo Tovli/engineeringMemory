@@ -66,15 +66,22 @@ layer.
   request/response examples are the M7 deliverables.
 - The server **binds to loopback (`127.0.0.1`) by default** and ships with **no authentication** in M7,
   consistent with the local-first, single-tenant storage style. It is not a remotely exposed service.
-- The API and CLI share store *paths* but follow redb's single-process / single-writer model: the API is the
-  long-running owner of the stores while it runs. Concurrent writes from a separate CLI process against the
-  same database files are out of scope for M7.
+- The API and CLI can use the same store while the API runs. Follow the temporary store lock
+  and recovery policy in [ADR-0014](0014-durable-single-document-ingestion.md).
+  Each store operation checks recovery and closes its handles before releasing the lock.
+  For `POST /ask`, capture the retrieval results and answer context and persist the
+  retrieval-run evidence under the lock. Release the lock before calling the LLM. Acquire
+  it again for any subsequent answer-log write. Cite the captured retrieval results even
+  if another process updates the store during generation.
+  Return HTTP `503` with a structured `store_in_use` code when lock acquisition times out.
+  Return `503` with `recovery_required` when the recovery check cannot complete. Preserve
+  the distinct codes so callers can retry contention and diagnose blocked recovery.
 - Any future remote exposure, multi-tenant access, authentication/authorization, or rate limiting must be a
   separate ADR; it is explicitly not introduced here.
 
 ## Consequences
 - **+** The PRD acceptance criteria are met structurally: handlers call the same services as the CLI, so
-  search/ask/feedback behaviour cannot diverge between interfaces, and the CLI is untouched.
+  search/ask/feedback share the same behavior and the CLI retains its commands.
 - **+** The hexagonal seam is demonstrated end to end — two inbound adapters (CLI, HTTP) over one core — which
   is the milestone's learning outcome.
 - **+** Reusing existing serde DTOs as the wire format keeps the API honest about scores, ranks, search mode,
@@ -88,9 +95,8 @@ layer.
   executor. This complexity is new surface area to test.
 - **-** Code-generated OpenAPI couples handlers to annotation macros; the spec is only as correct as the
   annotations, so example-driven contract tests are needed to keep it trustworthy.
-- **-** Sharing redb store paths with the CLI means the API effectively owns the stores while running;
-  documentation must warn against concurrent CLI writes to the same database to avoid lock contention or
-  corruption.
+- **-** Requests to a shared store can wait or time out while a CLI operation holds the lock.
+  Document contention behavior and close store handles before the request releases the lock.
 - **-** Loopback-only and no-auth are correct for local-first but mean the API is not deployable as-is; a
   later milestone needs an explicit security ADR before any remote use.
 - **Future:** Authentication, remote binding, multi-tenant isolation, streaming responses (SSE/WebSocket for

@@ -6,10 +6,10 @@ use redb::{Database, ReadableTable, TableDefinition};
 use crate::ingestion::domain::{DocumentId, DocumentStatus, IngestionDocument};
 use crate::ingestion::ports::DocumentRepository;
 
-const DOCS: TableDefinition<&str, &str> = TableDefinition::new("documents");
+pub(crate) const DOCS: TableDefinition<&str, &str> = TableDefinition::new("documents");
 
 pub struct RedbDocumentRepository {
-    db: Database,
+    pub(crate) db: Database,
 }
 
 impl RedbDocumentRepository {
@@ -30,6 +30,11 @@ impl RedbDocumentRepository {
             out.push(serde_json::from_str(v.value())?);
         }
         Ok(out)
+    }
+
+    pub(crate) fn indexed_model(&self) -> anyhow::Result<Option<(String, usize)>> {
+        Ok(self.all()?.into_iter().find(|doc| doc.status != DocumentStatus::Deleted)
+            .map(|doc| (doc.embedding_model, doc.embedding_dimension)))
     }
 }
 
@@ -59,12 +64,29 @@ impl DocumentRepository for RedbDocumentRepository {
     }
 
     fn soft_delete(&self, id: &DocumentId) -> anyhow::Result<()> {
-        // Keyed by path; find the matching record, flip status, re-save.
-        let target = self.all()?.into_iter().find(|d| &d.id == id);
-        if let Some(mut doc) = target {
-            doc.status = DocumentStatus::Deleted;
-            self.save(&doc)?;
+        let tx = self.db.begin_write()?;
+        let target = {
+            let docs = tx.open_table(DOCS)?;
+            let mut target = None;
+            for row in docs.iter()? {
+                let (key, value) = row?;
+                let mut doc: serde_json::Value = serde_json::from_str(value.value())?;
+                if doc.get("id").and_then(|v| v.as_str()) == Some(id) {
+                    doc["status"] = serde_json::json!("Deleted");
+                    target = Some((key.value().to_owned(), serde_json::to_string(&doc)?));
+                    break;
+                }
+            }
+            target
+        };
+        if let Some((path, document)) = target {
+            {
+                let mut docs = tx.open_table(DOCS)?;
+                docs.insert(path.as_str(), document.as_str())?;
+            }
+            crate::image_memory::links::suppress_for_document(&tx, id)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -72,7 +94,11 @@ impl DocumentRepository for RedbDocumentRepository {
         Ok(self
             .all()?
             .into_iter()
-            .filter(|d| d.status != DocumentStatus::Deleted && d.source_path.starts_with(root))
+            .filter(|d| {
+                d.status != DocumentStatus::Deleted
+                    && !d.source_path.starts_with("mcp://")
+                    && std::path::Path::new(&d.source_path).starts_with(root)
+            })
             .collect())
     }
 }

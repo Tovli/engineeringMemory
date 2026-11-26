@@ -57,7 +57,11 @@ impl VectorStorePort for RuVectorStoreAdapter {
             }
             let mut md: HashMap<String, Value> = HashMap::new();
             for (k, v) in &it.chunk.metadata {
-                md.insert(k.clone(), Value::String(v.clone()));
+                if k == "user_metadata" {
+                    md.insert(k.clone(), serde_json::from_str(v)?);
+                } else {
+                    md.insert(k.clone(), Value::String(v.clone()));
+                }
             }
             md.insert("document_id".into(), Value::String(it.chunk.document_id.clone()));
             md.insert("chunk_index".into(), Value::from(it.chunk.chunk_index));
@@ -90,6 +94,8 @@ impl VectorStorePort for RuVectorStoreAdapter {
                 };
                 let mut all = existing;
                 all.append(&mut ids);
+                all.sort();
+                all.dedup();
                 let json = serde_json::to_string(&all)?;
                 table.insert(doc_id.as_str(), json.as_str())?;
             }
@@ -108,6 +114,16 @@ impl VectorStorePort for RuVectorStoreAdapter {
             table.remove(id.as_str())?;
         }
         wtxn.commit()?;
+        Ok(())
+    }
+}
+
+impl RuVectorStoreAdapter {
+    /// Delete known chunk IDs, even when a crash occurred before the sidecar write.
+    pub fn delete_chunks(&self, ids: &[String]) -> anyhow::Result<()> {
+        for id in ids {
+            self.db.delete(id).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        }
         Ok(())
     }
 }

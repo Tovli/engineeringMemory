@@ -13,8 +13,9 @@ use crate::ingestion::domain::{
 };
 use crate::ingestion::embedding::EmbeddingService;
 use crate::ingestion::ports::{
-    ChunkWithEmbedding, DocumentRepository, Embedder, FileParser, KeywordIndexPort, VectorStorePort,
+    DocumentRepository, Embedder, FileParser, KeywordIndexPort, VectorStorePort,
 };
+use crate::ingestion::processing::{persist_chunks, prepare_chunks, remove_document_chunks};
 
 #[derive(Debug, Clone, Default)]
 pub struct IngestOptions {
@@ -112,21 +113,10 @@ impl<'a> IngestionOrchestrator<'a> {
                 }
             };
 
-            let mut chunks = self.chunking.chunk(&parsed, &ext, &did);
-            // Enrich chunk metadata (R5 / AC-6).
-            for c in &mut chunks {
-                let char_len = c.content.chars().count();
-                c.metadata.insert("source_path".into(), path_str.clone());
-                c.metadata
-                    .insert("char_length".into(), char_len.to_string());
-                c.metadata
-                    .insert("embedding_model".into(), model.name.clone());
-                c.metadata
-                    .insert("embedding_dimension".into(), model.dimension.to_string());
-                if let Some(t) = &parsed.title {
-                    c.metadata.insert("title".into(), t.clone());
-                }
-            }
+            let (chunks, vectors) = prepare_chunks(
+                &self.chunking, &parsed, &ext, &did, &path_str, self.embedder,
+                &std::collections::BTreeMap::new(),
+            )?;
 
             let file_name = path
                 .file_name()
@@ -173,8 +163,6 @@ impl<'a> IngestionOrchestrator<'a> {
                 continue;
             }
 
-            let vectors = embed.embed_chunks(&chunks)?;
-
             if opts.dry_run {
                 // AC-7: report, no writes.
                 summary.files_ingested += 1;
@@ -185,24 +173,9 @@ impl<'a> IngestionOrchestrator<'a> {
 
             // Modified file → drop old chunks before re-indexing (AC-4).
             if existing.is_some() {
-                self.store.delete_by_document(&did)?;
-                if let Some(keyword_index) = self.keyword_index {
-                    keyword_index.delete_by_document(&did)?;
-                }
+                remove_document_chunks(self.store, self.keyword_index, &did)?;
             }
-            let items: Vec<ChunkWithEmbedding> = chunks
-                .iter()
-                .zip(vectors)
-                .map(|(c, v)| ChunkWithEmbedding {
-                    chunk: c,
-                    vector: v,
-                })
-                .collect();
-            self.store.upsert_chunks(&items)?; // AC-8 dim guard lives in the adapter
-            if let Some(keyword_index) = self.keyword_index {
-                let chunk_refs: Vec<_> = chunks.iter().collect();
-                keyword_index.upsert_chunks(&chunk_refs)?;
-            }
+            persist_chunks(self.store, self.keyword_index, &chunks, vectors)?;
 
             doc.status = DocumentStatus::Active;
             self.docs.save(&doc)?;
@@ -232,6 +205,7 @@ impl<'a> IngestionOrchestrator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingestion::ports::ChunkWithEmbedding;
     use crate::ingestion::domain::ChunkingConfig;
     use crate::ingestion::infra::mock_embedder::MockEmbedder;
     use crate::ingestion::infra::parsers::default_parsers;
